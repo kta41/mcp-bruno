@@ -1,6 +1,3 @@
-Aquí tienes el `README.md` reestructurado y estilizado. He añadido *badges* profesionales en la cabecera, iconos para cada sección, formato de tablas o listas resaltadas para los parámetros de las herramientas, y bloques de código tipados correctamente.
-
-```markdown
 # 🔌 Bruno MCP Server for Python
 
 <div align="center">
@@ -268,4 +265,4 @@ docker run --rm -i bruno-mcp-python
 ## 📄 License
 Released under the [MIT License](LICENSE).
 
-```
+
