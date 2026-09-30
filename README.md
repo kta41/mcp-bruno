@@ -259,8 +259,11 @@ docker run --rm -i bruno-mcp-python
 ├── .vscode/mcp.json       # Workspace MCP server entry
 └── bruno-mcp.example.toml # Commented configuration template
 ```
-
 ---
+mcp-name: io.github.Kta41/bruno-mcp
+---
+
+
 
 ## 📄 License
 Released under the [MIT License](LICENSE).
