@@ -1,32 +1,43 @@
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StringConstraints
+
+# Input hardening: LLM-provided arguments are bounded so malformed or hostile
+# inputs are rejected before reaching the filesystem or the bru CLI.
+PathString = Annotated[str, StringConstraints(min_length=1, max_length=2048)]
+ShortString = Annotated[str, StringConstraints(min_length=1, max_length=256)]
+VariableName = Annotated[str, StringConstraints(pattern=r"^[A-Za-z_][A-Za-z0-9_.\-]{0,127}$")]
+EnvVarAssignment = Annotated[str, StringConstraints(pattern=r"^[A-Za-z_][A-Za-z0-9_.\-]{0,127}=.{0,2048}$")]
+FilterValue = Annotated[str, StringConstraints(max_length=2048)]
 
 
 class RunCollectionParams(BaseModel):
-    collection: str = Field(
+    collection: PathString = Field(
         description=(
             "Path to the Bruno collection directory, a .bru/.vru request file, or an opencollection.yml file. "
             "When opencollection.yml is provided, the server runs its parent collection directory."
         ),
         examples=["/home/user/api-tests/bruno/collections/example/opencollection.yml"],
     )
-    environment: str | None = Field(
+    environment: ShortString | None = Field(
         default=None,
         description="Optional Bruno environment name or environment file accepted by `bru run --env`.",
         examples=["dev"],
     )
-    variables: list[str] | None = Field(
+    variables: list[EnvVarAssignment] | None = Field(
         default=None,
+        max_length=64,
         description="Optional Bruno environment variables passed as repeated `--env-var` values. Use KEY=value strings.",
         examples=[["BASE_URL=https://api.example.com", "TOKEN=redacted"]],
     )
-    inherited_variables: list[str] | None = Field(
+    inherited_variables: list[VariableName] | None = Field(
         default=None,
+        max_length=32,
         description=(
-            "Optional names of environment variables to read from the MCP server process and pass to Bruno as `--env-var`. "
+            "Optional names of environment variables to read from the MCP server process and inject into Bruno "
+            "via a temporary private --env-file (values never appear in CLI arguments or logs). "
             "Use this for secrets so the LLM only provides variable names, never values."
         ),
         examples=[["BRUNO_AUTH_TOKEN", "BRUNO_API_KEY"]],
@@ -34,7 +45,7 @@ class RunCollectionParams(BaseModel):
 
 
 class DiscoverEnvironmentsParams(BaseModel):
-    collection: str = Field(
+    collection: PathString = Field(
         description=(
             "Path to a Bruno collection under a bruno/collections-style tree. "
             "The server will look for a sibling environments directory."
@@ -44,7 +55,7 @@ class DiscoverEnvironmentsParams(BaseModel):
 
 
 class ListCollectionsParams(BaseModel):
-    root: str | None = Field(
+    root: PathString | None = Field(
         default=None,
         description=(
             "Optional Bruno root directory. When omitted, the server uses roots from bruno-mcp.toml "
@@ -52,7 +63,7 @@ class ListCollectionsParams(BaseModel):
         ),
         examples=["/home/user/project/bruno"],
     )
-    query: str | None = Field(
+    query: ShortString | None = Field(
         default=None,
         description="Optional case-insensitive text used to filter collection names and paths.",
         examples=["project1"],
@@ -60,28 +71,33 @@ class ListCollectionsParams(BaseModel):
 
 
 class ListRequestFiltersParams(BaseModel):
-    collection: str = Field(
+    collection: PathString = Field(
         description="Path to the Bruno collection directory or opencollection.yml file to inspect for query filters.",
         examples=["/home/user/project/bruno/collections/project1"],
     )
 
 
 class FilterScenario(BaseModel):
-    name: str = Field(description="Human-readable scenario name.")
-    request: str = Field(description="Request YAML path relative to the collection root.")
-    query_params: dict[str, str] = Field(description="Query params to enable or override for this scenario.")
+    name: ShortString = Field(description="Human-readable scenario name.")
+    request: PathString = Field(description="Request YAML path relative to the collection root.")
+    query_params: dict[VariableName, FilterValue] = Field(
+        max_length=32,
+        description="Query params to enable or override for this scenario.",
+    )
 
 
 class RunFilterScenariosParams(BaseModel):
-    collection: str = Field(description="Path to the Bruno collection directory or opencollection.yml file.")
-    environment: str | None = Field(default=None, description="Optional Bruno environment name.")
-    variables: list[str] | None = Field(default=None, description="Optional non-secret KEY=value variables.")
-    inherited_variables: list[str] | None = Field(
+    collection: PathString = Field(description="Path to the Bruno collection directory or opencollection.yml file.")
+    environment: ShortString | None = Field(default=None, description="Optional Bruno environment name.")
+    variables: list[EnvVarAssignment] | None = Field(default=None, max_length=64, description="Optional non-secret KEY=value variables.")
+    inherited_variables: list[VariableName] | None = Field(
         default=None,
+        max_length=32,
         description="Optional secret variable names to inherit from the MCP server process.",
     )
     scenarios: list[FilterScenario] | None = Field(
         default=None,
+        max_length=100,
         description="Optional explicit filter scenarios. When omitted, scenarios are generated from disabled query params.",
     )
     max_scenarios: int = Field(
@@ -93,16 +109,17 @@ class RunFilterScenariosParams(BaseModel):
 
 
 class ReadRunArtifactParams(BaseModel):
-    path: str = Field(description="Path returned by run-collection or run-filter-scenarios as artifact_path.")
+    path: PathString = Field(description="Path returned by run-collection or run-filter-scenarios as artifact_path.")
     max_items: int = Field(default=3, ge=1, le=20, description="Maximum response items to sample per request.")
 
 
 class RunFullValidationParams(BaseModel):
-    collection: str = Field(description="Path to the Bruno collection directory or opencollection.yml file.")
-    environment: str | None = Field(default=None, description="Optional Bruno environment name.")
-    variables: list[str] | None = Field(default=None, description="Optional non-secret KEY=value variables.")
-    inherited_variables: list[str] | None = Field(
+    collection: PathString = Field(description="Path to the Bruno collection directory or opencollection.yml file.")
+    environment: ShortString | None = Field(default=None, description="Optional Bruno environment name.")
+    variables: list[EnvVarAssignment] | None = Field(default=None, max_length=64, description="Optional non-secret KEY=value variables.")
+    inherited_variables: list[VariableName] | None = Field(
         default=None,
+        max_length=32,
         description="Optional secret variable names to inherit from the MCP server process.",
     )
     max_scenarios: int = Field(

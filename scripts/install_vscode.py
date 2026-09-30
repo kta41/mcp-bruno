@@ -8,10 +8,12 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SERVER_NAME = "bruno-runner"
 DEFAULT_BRUNO_CONFIG_PATH = Path.home() / ".config" / "bruno-mcp" / "config.toml"
+
+# Keep in sync with bruno_mcp.settings.DEFAULT_BRU_CLI_VERSION.
+DEFAULT_BRU_CLI_VERSION = "4.2.0"
 
 
 def main() -> None:
@@ -271,6 +273,13 @@ inherited_variables = [
 BRUNO_AUTH_TOKEN = ["BRUNO_AUTH_TOKEN", "bearerToken", "BEARER_TOKEN", "AUTH_TOKEN", "TOKEN", "accessToken", "access_token"]
 BRUNO_API_KEY = ["BRUNO_API_KEY", "apiKey", "API_KEY", "xApiKey", "x-api-key"]
 
+# Execution hardening defaults (see bruno-mcp.example.toml for the full reference):
+# [bruno]     cli_version pins the Bruno CLI; auto_install defaults to false (fail closed).
+# [limits]    run_timeout_seconds, max_output_bytes, max_concurrent_runs.
+# [artifacts] ttl_hours / max_files control retention of raw run reports.
+# [security]  enforce_root_confinement (default true) rejects collection paths outside
+#             [workspace] roots once at least one configured root exists on disk.
+
 [defaults]
 # Change this to the environment you use most often, for example: local, dev, des, pre.
 environment = \"des\"
@@ -289,7 +298,7 @@ def ensure_bru_cli() -> None:
         )
 
     print("Bruno CLI `bru` was not found. Installing @usebruno/cli with npm...")
-    subprocess.run([npm_command, "install", "-g", "@usebruno/cli"], check=True)
+    subprocess.run([npm_command, "install", "-g", f"@usebruno/cli@{DEFAULT_BRU_CLI_VERSION}"], check=True)
 
     if not shutil.which("bru"):
         raise RuntimeError("npm installation completed, but `bru` is still not available in PATH.")

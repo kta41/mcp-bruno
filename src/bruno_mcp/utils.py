@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import time
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
-from typing import AsyncIterator
 
 
 @asynccontextmanager
@@ -15,7 +15,5 @@ async def report_file(prefix: str, extension: str) -> AsyncIterator[Path]:
     try:
         yield output_file
     finally:
-        try:
+        with suppress(FileNotFoundError):
             output_file.unlink()
-        except FileNotFoundError:
-            pass

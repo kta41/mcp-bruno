@@ -1,0 +1,29 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.kta41/mcp-bruno",
+  "description": "Python MCP server for running and inspecting Bruno API collections.",
+  "repository": {
+    "url": "https://github.com/Kta41/mcp-bruno",
+    "source": "github"
+  },
+  "version": "0.1.1",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "mcp-bruno",
+      "version": "0.1.1",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "description": "Bearer token or auth token passed securely to Bruno collections",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": true,
+          "name": "BRUNO_AUTH_TOKEN"
+        }
+      ]
+    }
+  ]
+}

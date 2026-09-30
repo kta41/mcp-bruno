@@ -35,9 +35,11 @@ def create_server() -> Server:
                         "with success, request summary, per-request details, failures, and execution timings. Provide "
                         "`collection` as the collection path; optionally pass `environment` and "
                         "non-secret `variables` as KEY=value strings. For secrets, pass only names "
-                        "through `inherited_variables`; values are read from the MCP server process."
+                        "through `inherited_variables`; values are read from the MCP server process and "
+                        "injected via a temporary private --env-file, never via CLI arguments. "
+                        "Collection paths must stay inside the configured workspace roots."
                     ),
-                    inputSchema=RunCollectionParams.model_json_schema(),
+                    input_schema=RunCollectionParams.model_json_schema(),
                 ),
                 types.Tool(
                     name="list-collections",
@@ -46,7 +48,7 @@ def create_server() -> Server:
                         "List Bruno collections below a root directory or configured roots. Use this "
                         "when the user gives a partial collection name instead of a full path."
                     ),
-                    inputSchema=ListCollectionsParams.model_json_schema(),
+                    input_schema=ListCollectionsParams.model_json_schema(),
                 ),
                 types.Tool(
                     name="discover-environments",
@@ -56,7 +58,7 @@ def create_server() -> Server:
                         "environments directory, available environment names, and variable names. "
                         "Secret values are not returned."
                     ),
-                    inputSchema=DiscoverEnvironmentsParams.model_json_schema(),
+                    input_schema=DiscoverEnvironmentsParams.model_json_schema(),
                 ),
                 types.Tool(
                     name="list-request-filters",
@@ -65,7 +67,7 @@ def create_server() -> Server:
                         "Inspect OpenCollection YAML requests and return enabled and disabled query params "
                         "that can be used as filter scenarios. Secret values are not returned."
                     ),
-                    inputSchema=ListRequestFiltersParams.model_json_schema(),
+                    input_schema=ListRequestFiltersParams.model_json_schema(),
                 ),
                 types.Tool(
                     name="run-filter-scenarios",
@@ -78,7 +80,7 @@ def create_server() -> Server:
                         "failures (auth, routing, timeout, connectivity) are reported as inconclusive, never "
                         "as filter defects. Source collection files are not modified."
                     ),
-                    inputSchema=RunFilterScenariosParams.model_json_schema(),
+                    input_schema=RunFilterScenariosParams.model_json_schema(),
                 ),
                 types.Tool(
                     name="read-result-artifact",
@@ -88,7 +90,7 @@ def create_server() -> Server:
                         "run-collection or run-filter-scenarios. Use this when response data is too large "
                         "to include directly in a tool result."
                     ),
-                    inputSchema=ReadRunArtifactParams.model_json_schema(),
+                    input_schema=ReadRunArtifactParams.model_json_schema(),
                 ),
                 types.Tool(
                     name="run-full-validation",
@@ -103,12 +105,13 @@ def create_server() -> Server:
                         "consolidated result stating which phase ran, per-endpoint baseline status, and "
                         "per-endpoint per-filter pass/fail/skip with the reason."
                     ),
-                    inputSchema=RunFullValidationParams.model_json_schema(),
+                    input_schema=RunFullValidationParams.model_json_schema(),
                 )
             ]
         )
 
     async def call_tool(_context: Any, params: Any) -> types.CallToolResult:
+        result: Any
         if params.name == "list-collections":
             list_params = ListCollectionsParams(**(params.arguments or {}))
             result = await runner.list_collections(list_params)

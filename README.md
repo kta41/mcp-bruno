@@ -20,7 +20,7 @@
 * **Run Bruno collections** natively using the Bruno CLI.
 * **Discover collections** and sibling environment files automatically.
 * **Support environment files** and dynamic environment variables.
-* **Secure Secret Injection:** Pass secrets to Bruno without exposing values to the LLM via `inherited_variables`.
+* **Secure Secret Injection:** Pass secrets to Bruno without exposing values to the LLM via `inherited_variables`. Secret values are injected through a temporary, owner-only `--env-file` and the child process environment — they never appear in CLI arguments (`ps` output) or logs.
 * **Filter Inspection:** Inspect documented query filters and run temporary filter scenarios without modifying the source collection.
 * **Two-Phase Full Validation:** Execute baseline tests + all documented filters in a single tool call.
 * **Normalized Outputs:** Return structured execution results containing `success`, `summary`, `failures`, and `timings`.
@@ -33,11 +33,13 @@
 * **Package Manager:** `uv`
 * **Node Package Manager:** `npm` *(only if the Bruno CLI is not already installed)*
 
-The installer checks whether the Bruno CLI command `bru` is available. If it is missing and `npm` is available, it automatically installs it with:
+The installer checks whether the Bruno CLI command `bru` is available. If it is missing, the server fails with an explicit error instead of silently installing packages. To install the pinned version manually:
 
 ```bash
-npm install -g @usebruno/cli
+npm install -g @usebruno/cli@4.2.0
 ```
+
+Runtime auto-install is available but opt-in: set `BRUNO_MCP_AUTO_INSTALL_BRU=1` (or `auto_install = true` under `[bruno]` in the config file) and the server installs exactly the pinned version from `cli_version` / `BRUNO_MCP_BRU_VERSION`.
 
 ---
 
@@ -88,6 +90,22 @@ roots = [
   "/home/user/project/bruno"
 ]
 
+[bruno]
+cli_version = "4.2.0"   # pinned Bruno CLI version
+auto_install = false     # never install bru silently at runtime
+
+[limits]
+run_timeout_seconds = 300
+max_output_bytes = 8388608
+max_concurrent_runs = 2
+
+[artifacts]
+ttl_hours = 24           # raw reports are auto-deleted after this
+max_files = 50
+
+[security]
+enforce_root_confinement = true   # reject collection paths outside workspace roots
+
 [auth]
 inherited_variables = [
   "BRUNO_AUTH_TOKEN",
@@ -97,6 +115,8 @@ inherited_variables = [
 [defaults]
 environment = "dev"
 ```
+
+Every setting can also be set via environment variables (`BRUNO_MCP_BRU_VERSION`, `BRUNO_MCP_AUTO_INSTALL_BRU`, `BRUNO_MCP_RUN_TIMEOUT`, `BRUNO_MCP_MAX_OUTPUT_BYTES`, `BRUNO_MCP_MAX_CONCURRENT_RUNS`, `BRUNO_MCP_ARTIFACTS_DIR`, `BRUNO_MCP_ARTIFACT_TTL_HOURS`, `BRUNO_MCP_ARTIFACT_MAX_FILES`, `BRUNO_MCP_ENFORCE_ROOT_CONFINEMENT`, `BRUNO_MCP_LOG_LEVEL`), which take precedence over the file.
 
 > **Note:** The installer creates `~/.config/bruno-mcp/config.toml` with a dummy root. Local `bruno-mcp.toml` files are git-ignored so real paths and environment names are never committed.
 
@@ -153,13 +173,19 @@ Runs a Bruno collection and returns normalized execution results.
 * **`collection`** *(required)*: Path to the Bruno collection.
 * **`environment`** *(optional)*: Path to an environment file.
 * **`variables`** *(optional)*: Environment variables as `KEY=value` strings.
-* **`inherited_variables`** *(optional)*: Names of environment variables to read from the MCP server process and pass to Bruno without exposing values to the LLM.
+* **`inherited_variables`** *(optional)*: Names of environment variables to read from the MCP server process and inject into Bruno without exposing values to the LLM. Values travel via a temporary owner-only `--env-file` and the child process environment (`{{process.env.NAME}}` also works) — never in CLI arguments.
 
 <details>
 <summary><b>View detailed authentication & path behavior</b></summary>
 
 **Auth Handling:**
-For secrets, prefer `inherited_variables` instead of writing values in chat. By default, the secure MCP input `BRUNO_AUTH_TOKEN` can satisfy Bruno variables named `bearerToken`, `BEARER_TOKEN`, `AUTH_TOKEN`, `TOKEN`, `accessToken`, or `access_token`. 
+For secrets, prefer `inherited_variables` instead of writing values in chat. By default, the secure MCP input `BRUNO_AUTH_TOKEN` can satisfy Bruno variables named `bearerToken`, `BEARER_TOKEN`, `AUTH_TOKEN`, `TOKEN`, `accessToken`, or `access_token`. Secrets are injected via a temporary private `--env-file`; if the selected `--env` environment file declares the same variable (which would take precedence inside bru), the run transparently switches to a temporary sanitized copy of the collection with the conflicting entry removed, so the injected secret always wins and source files are never modified.
+
+**Workspace confinement:**
+When `[workspace] roots` are configured (and at least one exists on disk), `collection` paths outside those roots are rejected with a clear error. Set `enforce_root_confinement = false` to disable.
+
+**Execution limits:**
+Each bru run has a configurable timeout (`run_timeout_seconds`, default 300s), bounded stdout/stderr capture (`max_output_bytes`), and a concurrency cap (`max_concurrent_runs`). Raw JSON reports are stored as artifacts with owner-only (`0600`) permissions and expire automatically (`ttl_hours` / `max_files`). Structured logs go to stderr (`BRUNO_MCP_LOG_LEVEL`).
 
 **Supported Collection Inputs:**
 * Collection directory: `/path/to/bruno/collections/project1`

@@ -1,22 +1,46 @@
+"""MCP-facing orchestration for running Bruno collections.
+
+Heavy lifting lives in focused modules:
+- execution.py: bru CLI discovery, version pinning, timeouts, output caps, concurrency.
+- artifacts.py: confined, permission-hardened artifact storage with retention.
+- filters.py: filter scenario parsing, request rewriting, and validation checks.
+- redaction.py: secret masking and bounded previews.
+"""
+
 from __future__ import annotations
 
-import asyncio
-import hashlib
 import json
+import logging
 import os
 import re
 import shutil
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
-from urllib.parse import quote as url_quote
-from urllib.parse import unquote, urlencode
+from typing import Any, Literal
 
+from bruno_mcp import artifacts
 from bruno_mcp.config import load_auth_variable_aliases, load_bruno_roots
+from bruno_mcp.execution import BruExecutor, secret_env_file
+from bruno_mcp.filters import (
+    apply_query_param_overrides,
+    build_filter_scenarios,
+    build_request_detail,
+    build_validation_checks,
+    classify_failure_layer,
+    first_yaml_value,
+    is_auth_failure,
+    is_failed_request,
+    parse_query_params,
+    sanitize_yaml_for_bru_cli,
+)
+from bruno_mcp.redaction import mask_bru_args, sha_prefix
+from bruno_mcp.responses import extract_response_items
+from bruno_mcp.settings import Settings, load_settings
 from bruno_mcp.types import (
-    BrunoRunResult,
     ArtifactInfo,
-    ArtifactRequestSummary,
+    BrunoRunResult,
     CollectionInfo,
     DiscoverEnvironmentsParams,
     DiscoverEnvironmentsResult,
@@ -32,59 +56,50 @@ from bruno_mcp.types import (
     ListCollectionsResult,
     ListRequestFiltersParams,
     ListRequestFiltersResult,
-    QueryParamInfo,
     ReadRunArtifactParams,
     ReadRunArtifactResult,
-    RequestDetail,
     RequestFilterInfo,
-    ResponseDataSummary,
+    RunCollectionParams,
     RunDiagnostics,
     RunFilterScenariosParams,
     RunFilterScenariosResult,
     RunFullValidationParams,
     RunFullValidationResult,
-    RunCollectionParams,
     Summary,
     Timings,
     ValidationCheck,
 )
 from bruno_mcp.utils import report_file
 
+logger = logging.getLogger("bruno_mcp.runner")
 
 REQUEST_SUMMARY_REGEX = re.compile(r"Requests:\s+(\d+)\s+passed,\s+(\d+)\s+failed,\s+(\d+)\s+total")
 VARIABLE_NAME_REGEX = re.compile(r"^[\s\"']*([A-Za-z_][A-Za-z0-9_\-.]*)[\s\"']*[:=]", re.MULTILINE)
-AUTH_FAILURE_REGEX = re.compile(
-    r"\b(401|403|unauthori[sz]ed|forbidden|token\s+(expired|invalid|caducad[oa]|inv[aá]lid[oa])|"
-    r"expired\s+token|invalid\s+token|jwt\s+expired|bearer)\b",
-    re.IGNORECASE,
-)
-ROUTING_FAILURE_REGEX = re.compile(r"\b(404|405)\b")
-TIMEOUT_FAILURE_REGEX = re.compile(r"\b(502|503|504|timed?\s*out|timeout|gateway\s*timeout)\b", re.IGNORECASE)
 YAML_PARSE_ERROR_REGEX = re.compile(r"YAMLParseError|Error parsing item", re.IGNORECASE)
-PLAIN_DESCRIPTION_WITH_COLON_REGEX = re.compile(r"^(\s*description:\s+)([^\"'\n].*:\s+.*)$")
-REQUEST_FILE_SUFFIXES = {".yml", ".yaml"}
-SECRET_KEY_REGEX = re.compile(r"token|secret|password|cookie|authorization|api[-_]?key|jwt|bearer", re.IGNORECASE)
-PERCENT_ENCODED_SEQUENCE_REGEX = re.compile(r"%[0-9A-Fa-f]{2}")
+ENV_FILE_SUFFIXES = (".json", ".bru", ".yml", ".yaml")
 
 
-def _mask_value(value: str) -> str:
-    if not value:
-        return "<empty>"
-    if len(value) <= 8:
-        return "*" * len(value)
-    return value[:3] + "..." + value[-3:]
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
-def _sha_prefix(value: str) -> str:
-    return hashlib.sha256(value.encode()).hexdigest()[:16]
-
-
-MAX_PREVIEW_LIST_ITEMS = 1
-MAX_PREVIEW_DICT_KEYS = 8
-MAX_PREVIEW_STRING_CHARS = 120
+def _timings(start_time: datetime, completed_time: datetime) -> Timings:
+    return Timings(
+        started=start_time.isoformat().replace("+00:00", "Z"),
+        completed=completed_time.isoformat().replace("+00:00", "Z"),
+        duration=int((completed_time - start_time).total_seconds() * 1000),
+    )
 
 
 class BrunoRunner:
+    def __init__(self, settings: Settings | None = None) -> None:
+        self._settings = settings or load_settings()
+        self._executor = BruExecutor(self._settings)
+
+    # ------------------------------------------------------------------
+    # MCP tools
+    # ------------------------------------------------------------------
+
     async def list_collections(self, params: ListCollectionsParams) -> ListCollectionsResult:
         roots = [Path(params.root).expanduser()] if params.root else load_bruno_roots()
         query = params.query.lower() if params.query else None
@@ -115,6 +130,7 @@ class BrunoRunner:
 
     async def discover_environments(self, params: DiscoverEnvironmentsParams) -> DiscoverEnvironmentsResult:
         collection_path = Path(params.collection).expanduser().resolve()
+        self._check_root_confinement(collection_path)
         environments_dir = self._find_environments_dir(collection_path)
 
         if environments_dir is None:
@@ -153,145 +169,108 @@ class BrunoRunner:
         )
 
     async def run_collection(self, params: RunCollectionParams) -> BrunoRunResult:
-        start_time = datetime.now(timezone.utc)
+        start_time = _utc_now()
+        collection_dir, collection_target = self._resolve_collection_target(Path(params.collection))
+        bru_command = await self._executor.ensure_bru_cli()
+        secrets, secret_diagnostics = self._resolve_secret_variables(params.inherited_variables)
 
-        async with report_file("bruno-run-", ".json") as output_file:
-            bru_command = await self._ensure_bru_cli()
-            collection_dir, collection_target = self._resolve_collection_target(Path(params.collection))
-
-            args = [bru_command, "run"]
-            if collection_target:
-                args.append(collection_target)
-
-            if params.environment:
-                args.extend(["--env", params.environment])
-
-            if params.variables:
-                for variable in params.variables:
-                    args.extend(["--env-var", variable])
-
-            inherited_diagnostics: list[InheritedVariableDiagnostic] = []
-            if params.inherited_variables:
-                for variable_name in params.inherited_variables:
-                    resolved = self._resolve_inherited_variable(variable_name)
-                    if resolved is None:
-                        raise RuntimeError(
-                            f"Missing inherited environment variable: {variable_name}. "
-                            f"Set BRUNO_AUTH_TOKEN (or BRUNO_BEARER_TOKEN) in the VS Code MCP secure input or in the server process environment."
-                        )
-                    target_name = resolved["target_name"]
-                    variable_value = resolved["value"]
-                    if not variable_value.strip():
-                        raise RuntimeError(
-                            f"Inherited variable {variable_name} resolved to an empty value. "
-                            f"Refresh BRUNO_AUTH_TOKEN in the VS Code MCP secure input; an empty token causes HTTP 401."
-                        )
-                    args.extend(["--env-var", f"{target_name}={variable_value}"])
-                    inherited_diagnostics.append(
-                        InheritedVariableDiagnostic(
-                            requested_name=variable_name,
-                            resolved_name=target_name,
-                            resolved=True,
-                            empty=False,
-                            source=resolved["source"],
-                            length=len(variable_value),
-                            sha256_prefix=_sha_prefix(variable_value),
-                        )
-                    )
-
-            args.extend(["--reporter-json", str(output_file)])
-            args.append("--reporter-skip-all-headers")
-
-            available_auth_vars = [
-                name
-                for name in ["BRUNO_AUTH_TOKEN", "BRUNO_BEARER_TOKEN", "BEARER_TOKEN", "bearerToken"]
-                if os.environ.get(name)
-            ]
-            diagnostics = RunDiagnostics(
-                cwd=str(collection_dir),
-                bru_args=self._mask_bru_args(args),
-                inherited_variables=inherited_diagnostics,
-                note=(
-                    "If Authorization header is missing, the token did not reach Bruno CLI. "
-                    f"Non-empty auth env vars visible to the server: {available_auth_vars or 'none'}. "
-                    "You can also write the token to ~/.config/bruno-mcp/.bearer_token as a fallback."
-                ),
-            )
-
-            returncode, stdout, stderr = await self._run_bru(args, collection_dir)
-
-            if returncode != 0 and YAML_PARSE_ERROR_REGEX.search(stderr):
-                sanitized_collection_dir = self._sanitize_collection_for_cli(collection_dir)
-                returncode, stdout, stderr = await self._run_bru(args, sanitized_collection_dir)
-
-            if returncode != 0 and not output_file.is_file() and not REQUEST_SUMMARY_REGEX.search(stdout):
-                raise RuntimeError(f"CLI stderr: {stderr or 'Unknown error'}")
-
-            result_json = output_file.read_text(encoding="utf-8")
-            artifact = self._write_artifact("bruno-run", result_json)
-            self._cleanup_sanitized_collections()
-            completed_time = datetime.now(timezone.utc)
-            duration = int((completed_time - start_time).total_seconds() * 1000)
-            json_result = json.loads(result_json)
-
-            first_result = json_result[0] if json_result else {}
-            summary_data = first_result.get("summary", {})
-            results = first_result.get("results", []) or []
-            requests = [self._build_request_detail(result) for result in results]
-            failed_requests = sum(1 for request in requests if self._is_failed_request(request))
-            success = failed_requests == 0
-
-            failures = [
-                Failure(
-                    name=request.name,
-                    message=request.error or f"HTTP {request.status} {request.status_text or ''}".strip(),
-                    auth_failure=self._is_auth_failure(
-                        " ".join(str(part) for part in [request.error, request.status, request.status_text] if part)
-                    ),
+        run_dir = self._prepare_run_dir(collection_dir, params, secrets)
+        logger.info("run_collection collection=%s environment=%s secrets=%d", collection_dir, params.environment, len(secrets))
+        try:
+            async with report_file("bruno-run-", ".json") as output_file:
+                args, diagnostics = self._prepare_bru_invocation(
+                    bru_command, collection_target, params, output_file, cwd=run_dir,
+                    secret_diagnostics=secret_diagnostics,
                 )
-                for request in requests
-                if self._is_failed_request(request)
-            ]
-            auth_failure = any(failure.auth_failure for failure in failures)
 
-            return BrunoRunResult(
-                success=success,
-                summary=Summary(
-                    total=summary_data.get("totalRequests") or 0,
-                    failed=failed_requests,
-                    passed=(summary_data.get("totalRequests") or 0) - failed_requests,
-                ),
-                requests=requests,
-                failures=failures,
-                artifact=artifact,
-                diagnostics=diagnostics,
-                auth_failure=auth_failure,
-                auth_message=(
-                    "One or more requests returned HTTP 401/403 or an auth-related error. "
-                    "If you already entered BRUNO_AUTH_TOKEN, it may be empty/expired/cached as empty by VS Code. "
-                    "Open the VS Code Command Palette, run 'MCP: Reset Input', re-enter the token, then restart the bruno-runner server."
-                    if auth_failure
-                    else None
-                ),
-                timings=Timings(
-                    started=start_time.isoformat().replace("+00:00", "Z"),
-                    completed=completed_time.isoformat().replace("+00:00", "Z"),
-                    duration=duration,
-                ),
-            )
+                with self._secret_env_context(secrets) as secret_args:
+                    full_args = [*args, *secret_args]
+                    diagnostics.bru_args = mask_bru_args(full_args)
+                    returncode, stdout, stderr = await self._executor.run(full_args, run_dir, env=self._bru_env(secrets))
+
+                    if returncode != 0 and YAML_PARSE_ERROR_REGEX.search(stderr) and run_dir == collection_dir:
+                        run_dir = self._sanitize_collection_for_cli(collection_dir)
+                        self._neutralize_env_conflicts(run_dir, params, secrets)
+                        returncode, stdout, stderr = await self._executor.run(
+                            full_args, run_dir, env=self._bru_env(secrets)
+                        )
+
+                if returncode != 0 and not output_file.is_file() and not REQUEST_SUMMARY_REGEX.search(stdout):
+                    raise RuntimeError(f"CLI stderr: {stderr or 'Unknown error'}")
+
+                result_json = output_file.read_text(encoding="utf-8")
+                artifact = self._write_artifact("bruno-run", result_json)
+                completed_time = _utc_now()
+                json_result = json.loads(result_json)
+
+                first_result = json_result[0] if json_result else {}
+                summary_data = first_result.get("summary", {})
+                results = first_result.get("results", []) or []
+                requests = [build_request_detail(result) for result in results]
+                failed_requests = sum(1 for request in requests if is_failed_request(request))
+                success = failed_requests == 0
+
+                failures = [
+                    Failure(
+                        name=request.name,
+                        message=request.error or f"HTTP {request.status} {request.status_text or ''}".strip(),
+                        auth_failure=is_auth_failure(
+                            " ".join(str(part) for part in [request.error, request.status, request.status_text] if part)
+                        ),
+                    )
+                    for request in requests
+                    if is_failed_request(request)
+                ]
+                auth_failure = any(failure.auth_failure for failure in failures)
+                logger.info(
+                    "run_collection_done success=%s total=%d failed=%d duration_ms=%d",
+                    success,
+                    len(requests),
+                    failed_requests,
+                    int((completed_time - start_time).total_seconds() * 1000),
+                )
+
+                return BrunoRunResult(
+                    success=success,
+                    summary=Summary(
+                        total=summary_data.get("totalRequests") or 0,
+                        failed=failed_requests,
+                        passed=(summary_data.get("totalRequests") or 0) - failed_requests,
+                    ),
+                    requests=requests,
+                    failures=failures,
+                    artifact=artifact,
+                    diagnostics=diagnostics,
+                    auth_failure=auth_failure,
+                    auth_message=(
+                        "One or more requests returned HTTP 401/403 or an auth-related error. "
+                        "If you already entered BRUNO_AUTH_TOKEN, it may be empty/expired/cached as empty by VS Code. "
+                        "Open the VS Code Command Palette, run 'MCP: Reset Input', re-enter the token, "
+                        "then restart the bruno-runner server."
+                        if auth_failure
+                        else None
+                    ),
+                    timings=_timings(start_time, completed_time),
+                )
+        finally:
+            self._cleanup_sanitized_collections()
 
     async def run_filter_scenarios(self, params: RunFilterScenariosParams) -> RunFilterScenariosResult:
-        start_time = datetime.now(timezone.utc)
-        bru_command = await self._ensure_bru_cli()
+        start_time = _utc_now()
         collection_dir, _collection_target = self._resolve_collection_target(Path(params.collection))
+        bru_command = await self._executor.ensure_bru_cli()
         request_filters = self._list_request_filter_info(collection_dir)
-        scenarios = params.scenarios or self._build_filter_scenarios(request_filters, params.max_scenarios)
+        scenarios = params.scenarios or build_filter_scenarios(request_filters, params.max_scenarios)
 
-        scenario_results, artifact, scenario_diagnostics = await self._execute_scenarios(
-            bru_command, collection_dir, scenarios, params
-        )
+        logger.info("run_filter_scenarios collection=%s scenarios=%d", collection_dir, len(scenarios))
+        try:
+            scenario_results, artifact, scenario_diagnostics = await self._execute_scenarios(
+                bru_command, collection_dir, scenarios, params
+            )
+        finally:
+            self._cleanup_sanitized_collections()
 
-        completed_time = datetime.now(timezone.utc)
+        completed_time = _utc_now()
         failed = 0
         inconclusive = 0
         failure_layers: dict[str, int] = {}
@@ -303,7 +282,7 @@ class BrunoRunner:
                 failed += 1
         auth_failure = any(
             result.request is not None
-            and self._is_auth_failure(
+            and is_auth_failure(
                 " ".join(
                     str(part)
                     for part in [result.request.error, result.request.status, result.request.status_text]
@@ -333,101 +312,11 @@ class BrunoRunner:
                 if auth_failure
                 else None
             ),
-            timings=Timings(
-                started=start_time.isoformat().replace("+00:00", "Z"),
-                completed=completed_time.isoformat().replace("+00:00", "Z"),
-                duration=int((completed_time - start_time).total_seconds() * 1000),
-            ),
+            timings=_timings(start_time, completed_time),
         )
 
-    async def _execute_scenarios(
-        self,
-        bru_command: str,
-        collection_dir: Path,
-        scenarios: list[FilterScenario],
-        params: Any,
-    ) -> tuple[list[FilterScenarioResult], ArtifactInfo, RunDiagnostics | None]:
-        scenario_results: list[FilterScenarioResult] = []
-        scenario_artifact_payloads: list[dict[str, Any]] = []
-        scenario_diagnostics: RunDiagnostics | None = None
-        baseline_items_by_request: dict[str, list[Any] | None] = {}
-        for scenario in scenarios:
-            sanitized_collection_dir = self._sanitize_collection_for_cli(collection_dir)
-            request_file = sanitized_collection_dir / scenario.request
-            if not request_file.is_file():
-                scenario_results.append(
-                    FilterScenarioResult(
-                        scenario=scenario,
-                        request=None,
-                        validation_checks=[
-                            ValidationCheck(
-                                name="request_file",
-                                status="failed",
-                                message=f"Request file not found in temporary collection: {scenario.request}",
-                            )
-                        ],
-                    )
-                )
-                continue
-
-            if scenario.request not in baseline_items_by_request:
-                baseline_items_by_request[scenario.request] = await self._run_request_baseline(
-                    bru_command, collection_dir, scenario.request, params
-                )
-            baseline_items = baseline_items_by_request[scenario.request]
-
-            self._apply_query_param_overrides(request_file, scenario.query_params)
-            async with report_file("bruno-filter-scenario-", ".json") as output_file:
-                args, scenario_diagnostics = self._build_bru_args(bru_command, scenario.request, params, output_file)
-                returncode, stdout, stderr = await self._run_bru(args, sanitized_collection_dir)
-
-                if returncode != 0 and not output_file.is_file() and not REQUEST_SUMMARY_REGEX.search(stdout):
-                    scenario_results.append(
-                        FilterScenarioResult(
-                            scenario=scenario,
-                            request=None,
-                            failure_layer="execution",
-                            validation_checks=[
-                                ValidationCheck(
-                                    name="bru_execution",
-                                    status="failed",
-                                    message=stderr or "Bruno CLI did not produce a JSON report.",
-                                )
-                            ],
-                        )
-                    )
-                    continue
-
-                json_result = json.loads(output_file.read_text(encoding="utf-8"))
-                scenario_artifact_payloads.append({"scenario": scenario.model_dump(), "report": json_result})
-                first_result = json_result[0] if json_result else {}
-                results = first_result.get("results", []) or []
-                raw_result = results[0] if results else {}
-                request = self._build_request_detail(raw_result) if raw_result else None
-                scenario_results.append(
-                    FilterScenarioResult(
-                        scenario=scenario,
-                        request=request,
-                        failure_layer=self._classify_failure_layer(request),
-                        validation_checks=self._build_validation_checks(raw_result, scenario.query_params, baseline_items),
-                    )
-                )
-
-        artifact = self._write_artifact("bruno-filter-scenarios", json.dumps(scenario_artifact_payloads, ensure_ascii=False))
-        self._cleanup_sanitized_collections()
-        return scenario_results, artifact, scenario_diagnostics
-
-    def _cleanup_sanitized_collections(self) -> None:
-        """Delete temporary sanitized collection copies; reports are already persisted as artifacts."""
-        sanitized_root = Path.cwd() / "build" / "sanitized-collections"
-        if not sanitized_root.is_dir():
-            return
-        for entry in sanitized_root.iterdir():
-            if entry.is_dir():
-                shutil.rmtree(entry, ignore_errors=True)
-
     async def run_full_validation(self, params: RunFullValidationParams) -> RunFullValidationResult:
-        start_time = datetime.now(timezone.utc)
+        start_time = _utc_now()
 
         baseline = await self.run_collection(
             RunCollectionParams(
@@ -442,10 +331,10 @@ class BrunoRunner:
             EndpointStatus(
                 name=request.name,
                 path=request.path,
-                status="failed" if self._is_failed_request(request) else "passed",
+                status="failed" if is_failed_request(request) else "passed",
                 message=(
                     request.error or f"HTTP {request.status} {request.status_text or ''}".strip()
-                    if self._is_failed_request(request)
+                    if is_failed_request(request)
                     else None
                 ),
             )
@@ -466,10 +355,10 @@ class BrunoRunner:
                 timings=baseline.timings,
             )
 
-        bru_command = await self._ensure_bru_cli()
+        bru_command = await self._executor.ensure_bru_cli()
         collection_dir, _collection_target = self._resolve_collection_target(Path(params.collection))
         request_filters = self._list_request_filter_info(collection_dir)
-        scenarios = self._build_filter_scenarios(request_filters, params.max_scenarios)
+        scenarios = build_filter_scenarios(request_filters, params.max_scenarios)
 
         scenario_params = RunFilterScenariosParams(
             collection=params.collection,
@@ -477,9 +366,12 @@ class BrunoRunner:
             variables=params.variables,
             inherited_variables=params.inherited_variables,
         )
-        scenario_results, filters_artifact, _diagnostics = await self._execute_scenarios(
-            bru_command, collection_dir, scenarios, scenario_params
-        )
+        try:
+            scenario_results, filters_artifact, _diagnostics = await self._execute_scenarios(
+                bru_command, collection_dir, scenarios, scenario_params
+            )
+        finally:
+            self._cleanup_sanitized_collections()
 
         request_filters_by_path = {request.path: request.name for request in request_filters}
         filters: list[FilterFinding] = []
@@ -491,7 +383,7 @@ class BrunoRunner:
                 if check.name.startswith("filter:") or check.name == "filter_impact"
             ]
             if result.failure_layer is not None:
-                status = "skipped"
+                status: Literal["passed", "failed", "skipped"] = "skipped"
                 message = f"Inconclusive: {result.failure_layer} failure - filter logic was not evaluated."
             elif failed_checks:
                 status = "failed"
@@ -519,7 +411,7 @@ class BrunoRunner:
 
         auth_failure = any(
             result.request is not None
-            and self._is_auth_failure(
+            and is_auth_failure(
                 " ".join(
                     str(part)
                     for part in [result.request.error, result.request.status, result.request.status_text]
@@ -529,7 +421,7 @@ class BrunoRunner:
             for result in scenario_results
         )
 
-        completed_time = datetime.now(timezone.utc)
+        completed_time = _utc_now()
         return RunFullValidationResult(
             phase="completed",
             baseline_summary=baseline.summary,
@@ -547,130 +439,158 @@ class BrunoRunner:
                 if auth_failure
                 else None
             ),
-            timings=Timings(
-                started=start_time.isoformat().replace("+00:00", "Z"),
-                completed=completed_time.isoformat().replace("+00:00", "Z"),
-                duration=int((completed_time - start_time).total_seconds() * 1000),
-            ),
+            timings=_timings(start_time, completed_time),
         )
-
-
-    def _is_auth_failure(self, message: str) -> bool:
-        return bool(AUTH_FAILURE_REGEX.search(message))
 
     def read_run_artifact(self, params: ReadRunArtifactParams) -> ReadRunArtifactResult:
-        artifact_path = Path(params.path).expanduser().resolve()
-        artifacts_root = (Path.cwd() / "build" / "artifacts").resolve()
-        if artifacts_root not in [artifact_path, *artifact_path.parents]:
-            raise RuntimeError("Artifact path is outside the Bruno MCP artifacts directory.")
-        if not artifact_path.is_file():
-            raise RuntimeError(f"Artifact not found: {artifact_path}")
+        return artifacts.read_run_artifact(params, self._settings)
 
-        artifact_data = json.loads(artifact_path.read_text(encoding="utf-8"))
-        reports = self._artifact_reports(artifact_data)
-        requests = []
-        for report in reports:
-            first_result = report[0] if isinstance(report, list) and report else {}
-            for result in first_result.get("results", []) or []:
-                requests.append(self._artifact_request_summary(result, params.max_items))
+    # ------------------------------------------------------------------
+    # Scenario execution
+    # ------------------------------------------------------------------
 
-        return ReadRunArtifactResult(
-            artifact=ArtifactInfo(path=str(artifact_path), description="Raw Bruno JSON report stored locally."),
-            requests=requests,
-        )
+    async def _execute_scenarios(
+        self,
+        bru_command: str,
+        collection_dir: Path,
+        scenarios: list[FilterScenario],
+        params: Any,
+    ) -> tuple[list[FilterScenarioResult], ArtifactInfo, RunDiagnostics | None]:
+        scenario_results: list[FilterScenarioResult] = []
+        scenario_artifact_payloads: list[dict[str, Any]] = []
+        scenario_diagnostics: RunDiagnostics | None = None
+        baseline_items_by_request: dict[str, list[Any] | None] = {}
+        secrets, secret_diagnostics = self._resolve_secret_variables(getattr(params, "inherited_variables", None))
 
-    def _artifact_reports(self, artifact_data: Any) -> list[Any]:
-        if isinstance(artifact_data, list) and artifact_data and isinstance(artifact_data[0], dict) and "report" in artifact_data[0]:
-            return [item.get("report") for item in artifact_data if isinstance(item, dict)]
-        return [artifact_data]
+        for scenario in scenarios:
+            sanitized_collection_dir = self._sanitize_collection_for_cli(collection_dir)
+            self._neutralize_env_conflicts(sanitized_collection_dir, params, secrets)
+            request_file = sanitized_collection_dir / scenario.request
+            if not request_file.is_file():
+                scenario_results.append(
+                    FilterScenarioResult(
+                        scenario=scenario,
+                        request=None,
+                        validation_checks=[
+                            ValidationCheck(
+                                name="request_file",
+                                status="failed",
+                                message=f"Request file not found in temporary collection: {scenario.request}",
+                            )
+                        ],
+                    )
+                )
+                continue
 
-    def _artifact_request_summary(self, result: dict, max_items: int) -> ArtifactRequestSummary:
-        request = result.get("request") or {}
-        response = result.get("response") or {}
-        response_data = response.get("data")
-        return ArtifactRequestSummary(
-            name=result.get("name") or result.get("suitename") or "Unknown request",
-            path=result.get("path"),
-            method=request.get("method"),
-            url=request.get("url"),
-            status=response.get("status") or result.get("status"),
-            status_text=response.get("statusText"),
-            response_time=response.get("responseTime") or response.get("duration"),
-            response_data=self._response_data_summary(response_data, max_items),
-        )
+            if scenario.request not in baseline_items_by_request:
+                baseline_items_by_request[scenario.request] = await self._run_request_baseline(
+                    bru_command, collection_dir, scenario.request, params, secrets, secret_diagnostics
+                )
+            baseline_items = baseline_items_by_request[scenario.request]
 
-    def _response_data_summary(self, response_data: Any, max_items: int) -> ResponseDataSummary:
-        items = self._extract_response_items(response_data)
-        top_level_keys = list(response_data.keys())[:20] if isinstance(response_data, dict) else []
-        item_keys = []
-        sample_items = []
+            apply_query_param_overrides(request_file, scenario.query_params)
+            async with report_file("bruno-filter-scenario-", ".json") as output_file:
+                args, scenario_diagnostics = self._prepare_bru_invocation(
+                    bru_command, scenario.request, params, output_file, cwd=sanitized_collection_dir,
+                    secret_diagnostics=secret_diagnostics,
+                )
+                with self._secret_env_context(secrets) as secret_args:
+                    full_args = [*args, *secret_args]
+                    scenario_diagnostics.bru_args = mask_bru_args(full_args)
+                    returncode, stdout, stderr = await self._executor.run(
+                        full_args, sanitized_collection_dir, env=self._bru_env(secrets)
+                    )
 
-        if items is not None:
-            key_names = set()
-            for item in items[:max_items]:
-                if isinstance(item, dict):
-                    key_names.update(str(key) for key in item.keys())
-                sample_items.append(self._preview_response_data(item))
-            item_keys = sorted(key_names)[:30]
+                if returncode != 0 and not output_file.is_file() and not REQUEST_SUMMARY_REGEX.search(stdout):
+                    scenario_results.append(
+                        FilterScenarioResult(
+                            scenario=scenario,
+                            request=None,
+                            failure_layer="execution",
+                            validation_checks=[
+                                ValidationCheck(
+                                    name="bru_execution",
+                                    status="failed",
+                                    message=stderr or "Bruno CLI did not produce a JSON report.",
+                                )
+                            ],
+                        )
+                    )
+                    continue
 
-        return ResponseDataSummary(
-            data_type=type(response_data).__name__ if response_data is not None else None,
-            item_count=len(items) if items is not None else None,
-            top_level_keys=top_level_keys,
-            item_keys=item_keys,
-            sample_items=sample_items,
-        )
+                json_result = json.loads(output_file.read_text(encoding="utf-8"))
+                scenario_artifact_payloads.append({"scenario": scenario.model_dump(), "report": json_result})
+                first_result = json_result[0] if json_result else {}
+                results = first_result.get("results", []) or []
+                raw_result = results[0] if results else {}
+                request = build_request_detail(raw_result) if raw_result else None
+                scenario_results.append(
+                    FilterScenarioResult(
+                        scenario=scenario,
+                        request=request,
+                        failure_layer=classify_failure_layer(request),
+                        validation_checks=build_validation_checks(raw_result, scenario.query_params, baseline_items),
+                    )
+                )
 
-    def _write_artifact(self, prefix: str, content: str) -> ArtifactInfo:
-        artifacts_dir = Path.cwd() / "build" / "artifacts"
-        artifacts_dir.mkdir(parents=True, exist_ok=True)
-        artifact_path = artifacts_dir / f"{prefix}-{int(datetime.now(timezone.utc).timestamp() * 1000)}.json"
-        artifact_path.write_text(content, encoding="utf-8")
-        return ArtifactInfo(path=str(artifact_path), description="Raw Bruno JSON report stored locally; use read-result-artifact for a bounded summary.")
+        artifact = self._write_artifact("bruno-filter-scenarios", json.dumps(scenario_artifact_payloads, ensure_ascii=False))
+        return scenario_results, artifact, scenario_diagnostics
 
-    def _build_request_detail(self, result: dict) -> RequestDetail:
-        request = result.get("request") or {}
-        response = result.get("response") or {}
-        response_data = response.get("data")
-        test_results = result.get("testResults") or []
-        assertion_results = result.get("assertionResults") or []
+    async def _run_request_baseline(
+        self,
+        bru_command: str,
+        collection_dir: Path,
+        request_path: str,
+        params: Any,
+        secrets: dict[str, str],
+        secret_diagnostics: list[InheritedVariableDiagnostic],
+    ) -> list[Any] | None:
+        """Run the request once without filter overrides and return its response items (None when unavailable)."""
+        sanitized_collection_dir = self._sanitize_collection_for_cli(collection_dir)
+        self._neutralize_env_conflicts(sanitized_collection_dir, params, secrets)
+        request_file = sanitized_collection_dir / request_path
+        if not request_file.is_file():
+            return None
+        async with report_file("bruno-filter-baseline-", ".json") as output_file:
+            args, _diagnostics = self._prepare_bru_invocation(
+                bru_command, request_path, params, output_file, cwd=sanitized_collection_dir,
+                secret_diagnostics=secret_diagnostics,
+            )
+            with self._secret_env_context(secrets) as secret_args:
+                await self._executor.run(
+                    [*args, *secret_args], sanitized_collection_dir, env=self._bru_env(secrets)
+                )
+            if not output_file.is_file():
+                return None
+            try:
+                json_result = json.loads(output_file.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                return None
+        first_result = json_result[0] if isinstance(json_result, list) and json_result else {}
+        results = first_result.get("results", []) or []
+        raw_result = results[0] if results else {}
+        response = raw_result.get("response") or {}
+        return extract_response_items(response.get("data"))
 
-        return RequestDetail(
-            name=result.get("name") or result.get("suitename") or "Unknown request",
-            path=result.get("path"),
-            method=request.get("method"),
-            url=request.get("url"),
-            status=response.get("status") or result.get("status"),
-            status_text=response.get("statusText"),
-            response_time=response.get("responseTime") or response.get("duration"),
-            response_data_type=type(response_data).__name__ if response_data is not None else None,
-            response_item_count=self._response_item_count(response_data),
-            response_body_preview=self._preview_response_data(response_data),
-            error=result.get("error"),
-            tests_total=len(test_results),
-            tests_passed=sum(1 for test in test_results if test.get("status") == "pass"),
-            tests_failed=sum(1 for test in test_results if test.get("status") == "fail"),
-            assertions_total=len(assertion_results),
-            assertions_passed=sum(1 for assertion in assertion_results if assertion.get("status") == "pass"),
-            assertions_failed=sum(1 for assertion in assertion_results if assertion.get("status") == "fail"),
-        )
+    # ------------------------------------------------------------------
+    # bru invocation assembly
+    # ------------------------------------------------------------------
 
-    def _is_failed_request(self, request: RequestDetail) -> bool:
-        if request.error:
-            return True
-        if isinstance(request.status, int):
-            return request.status >= 400
-        if isinstance(request.status, str) and request.status.isdigit():
-            return int(request.status) >= 400
-        return False
-
-    def _build_bru_args(
+    def _prepare_bru_invocation(
         self,
         bru_command: str,
         collection_target: str | None,
         params: Any,
         output_file: Path,
+        cwd: Path,
+        secret_diagnostics: list[InheritedVariableDiagnostic],
     ) -> tuple[list[str], RunDiagnostics]:
+        """Build the bru argument list (without secrets) and run diagnostics.
+
+        Secret variables are deliberately NOT part of the returned args: they travel
+        via a temporary `--env-file` (see _secret_env_context) so they never appear
+        in the process list or in logs.
+        """
         args = [bru_command, "run"]
         if collection_target:
             args.append(collection_target)
@@ -682,39 +602,9 @@ class BrunoRunner:
             for variable in params.variables:
                 args.extend(["--env-var", variable])
 
-        inherited_diagnostics: list[InheritedVariableDiagnostic] = []
-        if params.inherited_variables:
-            for variable_name in params.inherited_variables:
-                resolved = self._resolve_inherited_variable(variable_name)
-                if resolved is None:
-                    raise RuntimeError(
-                        f"Missing inherited environment variable: {variable_name}. "
-                        f"Set BRUNO_AUTH_TOKEN (or BRUNO_BEARER_TOKEN) in the VS Code MCP secure input or in the server process environment."
-                    )
-                target_names = self._alias_target_names(variable_name)
-                variable_value = resolved["value"]
-                if not variable_value.strip():
-                    raise RuntimeError(
-                        f"Inherited variable {variable_name} resolved to an empty value. "
-                        f"Refresh BRUNO_AUTH_TOKEN in the VS Code MCP secure input; an empty token causes HTTP 401."
-                    )
-                for target_name in target_names:
-                    args.extend(["--env-var", f"{target_name}={variable_value}"])
-                inherited_diagnostics.append(
-                    InheritedVariableDiagnostic(
-                        requested_name=variable_name,
-                        resolved_name=",".join(target_names),
-                        resolved=True,
-                        empty=False,
-                        source=resolved["source"],
-                        length=len(variable_value),
-                        sha256_prefix=_sha_prefix(variable_value),
-                    )
-                )
-
         args.extend(["--reporter-json", str(output_file)])
         args.append("--reporter-skip-all-headers")
-        cwd = self._resolve_collection_target(Path(params.collection))[0]
+
         available_auth_vars = [
             name
             for name in ["BRUNO_AUTH_TOKEN", "BRUNO_BEARER_TOKEN", "BEARER_TOKEN", "bearerToken"]
@@ -722,9 +612,11 @@ class BrunoRunner:
         ]
         diagnostics = RunDiagnostics(
             cwd=str(cwd),
-            bru_args=self._mask_bru_args(args),
-            inherited_variables=inherited_diagnostics,
+            bru_args=mask_bru_args(args),
+            inherited_variables=secret_diagnostics,
             note=(
+                "Secrets are injected via a temporary --env-file (never via CLI arguments) and are also "
+                "available to requests as process.env.<NAME>. "
                 "If Authorization header is missing, the token did not reach Bruno CLI. "
                 f"Non-empty auth env vars visible to the server: {available_auth_vars or 'none'}. "
                 "You can also write the token to ~/.config/bruno-mcp/.bearer_token as a fallback."
@@ -732,619 +624,196 @@ class BrunoRunner:
         )
         return args, diagnostics
 
-    def _mask_bru_args(self, args: list[str]) -> list[str]:
-        masked: list[str] = []
-        previous_arg = ""
-        for arg in args:
-            is_env_var_value = previous_arg == "--env-var" and "=" in arg
-            if is_env_var_value or (arg.startswith("--env-var=") and "=" in arg):
-                prefix = "" if is_env_var_value else "--env-var="
-                raw = arg if is_env_var_value else arg[len("--env-var="):]
-                key, _, value = raw.partition("=")
-                masked.append(f"{prefix}{key}={_mask_value(value)}")
-            elif "=" in arg and SECRET_KEY_REGEX.search(arg.split("=", 1)[0]):
-                key, value = arg.split("=", 1)
-                masked.append(f"{key}={_mask_value(value)}")
-            else:
-                masked.append(arg)
-            previous_arg = arg
-        return masked
+    def _resolve_secret_variables(
+        self, inherited_variables: list[str] | None
+    ) -> tuple[dict[str, str], list[InheritedVariableDiagnostic]]:
+        """Resolve requested inherited variables to {target_name: value}, expanding known aliases."""
+        secrets: dict[str, str] = {}
+        diagnostics: list[InheritedVariableDiagnostic] = []
+        if not inherited_variables:
+            return secrets, diagnostics
 
-    def _build_filter_scenarios(self, requests: list[RequestFilterInfo], max_scenarios: int) -> list[FilterScenario]:
-        scenarios: list[FilterScenario] = []
-        for request in requests:
-            for query_param in request.disabled_query_params:
-                if query_param.value is None:
-                    continue
-                if query_param.value.upper() == "ALL":
-                    continue
-                scenarios.append(
-                    FilterScenario(
-                        name=f"{request.name} - {query_param.name}={query_param.value}",
-                        request=request.path,
-                        query_params={query_param.name: query_param.value},
-                    )
+        for variable_name in inherited_variables:
+            resolved = self._resolve_inherited_variable(variable_name)
+            if resolved is None:
+                raise RuntimeError(
+                    f"Missing inherited environment variable: {variable_name}. "
+                    f"Set BRUNO_AUTH_TOKEN (or BRUNO_BEARER_TOKEN) in the VS Code MCP secure input or in the server process environment."
                 )
-                if len(scenarios) >= max_scenarios:
-                    return scenarios
-        return scenarios
-
-    def _list_request_filter_info(self, collection_dir: Path) -> list[RequestFilterInfo]:
-        requests = []
-        for request_file in sorted(collection_dir.rglob("*.yml")) + sorted(collection_dir.rglob("*.yaml")):
-            if request_file.name in {"opencollection.yml", "opencollection.yaml"}:
-                continue
-            if "environments" in request_file.relative_to(collection_dir).parts:
-                continue
-
-            try:
-                content = request_file.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                content = request_file.read_text(encoding="latin-1")
-
-            name = self._first_yaml_value(content, "info", "name") or request_file.stem
-            method = self._first_yaml_value(content, "http", "method")
-            url = self._first_yaml_value(content, "http", "url")
-            query_params = self._parse_query_params(content)
-            if not query_params:
-                continue
-
-            requests.append(
-                RequestFilterInfo(
-                    name=name,
-                    path=str(request_file.relative_to(collection_dir)),
-                    method=method,
-                    url=url,
-                    enabled_query_params=[param for param in query_params if not param.disabled],
-                    disabled_query_params=[param for param in query_params if param.disabled],
+            variable_value = resolved["value"]
+            if not variable_value.strip():
+                raise RuntimeError(
+                    f"Inherited variable {variable_name} resolved to an empty value. "
+                    f"Refresh BRUNO_AUTH_TOKEN in the VS Code MCP secure input; an empty token causes HTTP 401."
+                )
+            target_names = self._alias_target_names(variable_name) or [variable_name]
+            for target_name in target_names:
+                secrets[target_name] = variable_value
+            diagnostics.append(
+                InheritedVariableDiagnostic(
+                    requested_name=variable_name,
+                    resolved_name=",".join(target_names),
+                    resolved=True,
+                    empty=False,
+                    source=resolved["source"],
+                    length=len(variable_value),
+                    sha256_prefix=sha_prefix(variable_value),
                 )
             )
-        return requests
+        return secrets, diagnostics
 
-    def _first_yaml_value(self, content: str, section: str, key: str) -> str | None:
-        in_section = False
-        for line in content.splitlines():
-            if line == f"{section}:":
-                in_section = True
-                continue
-            if in_section and line and not line.startswith(" "):
-                return None
-            if in_section:
-                match = re.match(rf"^  {re.escape(key)}:\s*(.*)$", line)
-                if match:
-                    return self._clean_yaml_scalar(match.group(1))
+    @contextmanager
+    def _secret_env_context(self, secrets: dict[str, str]) -> Iterator[list[str]]:
+        """Yield the extra bru args that inject secrets without exposing them in the process list."""
+        if not secrets:
+            yield []
+            return
+        with secret_env_file(secrets) as env_file_path:
+            yield ["--env-file", str(env_file_path)]
+
+    @staticmethod
+    def _bru_env(secrets: dict[str, str]) -> dict[str, str] | None:
+        """Expose secrets to bru as process env vars too (enables {{process.env.NAME}} lookups)."""
+        if not secrets:
+            return None
+        return {**os.environ, **secrets}
+
+    # ------------------------------------------------------------------
+    # Environment conflict handling
+    # ------------------------------------------------------------------
+
+    def _prepare_run_dir(self, collection_dir: Path, params: Any, secrets: dict[str, str]) -> Path:
+        """Return the directory bru should run in.
+
+        When the selected environment file defines a variable that an injected secret
+        targets, bru's --env would take precedence over the --env-file secrets and
+        silently break auth. In that case the run happens in a temporary sanitized
+        copy with the conflicting entries removed from the environment file copy.
+        """
+        if not secrets or not getattr(params, "environment", None):
+            return collection_dir
+        conflicts = self._environment_secret_conflicts(collection_dir, params.environment, set(secrets))
+        if not conflicts:
+            return collection_dir
+        logger.info(
+            "env_conflict_neutralized environment=%s variables=%s",
+            params.environment,
+            sorted(conflicts),
+        )
+        run_dir = self._sanitize_collection_for_cli(collection_dir)
+        self._remove_env_variables(run_dir, params.environment, set(secrets))
+        return run_dir
+
+    def _neutralize_env_conflicts(self, run_dir: Path, params: Any, secrets: dict[str, str]) -> None:
+        environment = getattr(params, "environment", None)
+        if not secrets or not environment:
+            return
+        self._remove_env_variables(run_dir, environment, set(secrets))
+
+    def _find_environment_file(self, collection_dir: Path, environment: str) -> Path | None:
+        environments_dir = self._find_environments_dir(collection_dir)
+        if environments_dir is None:
+            return None
+        for suffix in ENV_FILE_SUFFIXES:
+            candidate = environments_dir / f"{environment}{suffix}"
+            if candidate.is_file():
+                return candidate
         return None
 
-    def _parse_query_params(self, content: str) -> list[QueryParamInfo]:
-        params = []
-        in_params = False
-        current: dict[str, Any] | None = None
-
-        for line in content.splitlines():
-            if line == "  params:":
-                in_params = True
-                continue
-            if in_params and line.startswith("  ") and not line.startswith("    "):
-                break
-            if not in_params:
-                continue
-
-            name_match = re.match(r"^    - name:\s*(.*)$", line)
-            if name_match:
-                if current and current.get("type") == "query":
-                    params.append(QueryParamInfo(**current))
-                current = {"name": self._clean_yaml_scalar(name_match.group(1)), "disabled": False}
-                continue
-
-            if current is None:
-                continue
-
-            field_match = re.match(r"^      (value|type|description|disabled):\s*(.*)$", line)
-            if not field_match:
-                continue
-            field, value = field_match.groups()
-            if field == "disabled":
-                current[field] = self._clean_yaml_scalar(value).lower() == "true"
-            else:
-                current[field] = self._clean_yaml_scalar(value)
-
-        if current and current.get("type") == "query":
-            params.append(QueryParamInfo(**current))
-        return params
-
-    def _clean_yaml_scalar(self, value: str) -> str:
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-            return value[1:-1]
-        return value
-
-    def _apply_query_param_overrides(self, request_file: Path, query_params: dict[str, str]) -> None:
-        lines = request_file.read_text(encoding="utf-8").splitlines()
-        updated: list[str] = []
-        index = 0
-
-        while index < len(lines):
-            name_match = re.match(r"^(    - name:\s*)(.*)$", lines[index])
-            if not name_match:
-                updated.append(lines[index])
-                index += 1
-                continue
-
-            param_name = self._clean_yaml_scalar(name_match.group(2))
-            block = [lines[index]]
-            index += 1
-            while index < len(lines) and not re.match(r"^    - name:\s*", lines[index]):
-                block.append(lines[index])
-                index += 1
-
-            if param_name in query_params:
-                block = self._override_query_param_block(block, query_params[param_name])
-            updated.extend(block)
-
-        # bru CLI does not reliably transmit query params declared in the `params:` block,
-        # so the overridden params are also embedded directly in the request URL.
-        updated = self._embed_query_params_in_url(updated, query_params)
-
-        request_file.write_text("\n".join(updated) + "\n", encoding="utf-8")
-
-    def _embed_query_params_in_url(self, lines: list[str], query_params: dict[str, str]) -> list[str]:
-        if not query_params:
-            return lines
-        # `bru` re-encodes the query string itself when it executes the request, so pre-encoding
-        # reserved-but-valid-in-query characters like ':' here would make it end up double-encoded.
-        query_string = urlencode(
-            {key: self._normalize_query_param_value(value) for key, value in query_params.items()},
-            safe=":",
-            quote_via=url_quote,
-        )
-        updated: list[str] = []
-        embedded = False
-        for line in lines:
-            match = re.match(r"^(\s*url:\s*)(.*)$", line) if not embedded else None
-            if not match:
-                updated.append(line)
-                continue
-            prefix, raw_url = match.groups()
-            raw_url = raw_url.strip()
-            quote = raw_url[0] if raw_url[:1] in {"'", '"'} and raw_url.endswith(raw_url[0]) else ""
-            url = raw_url[1:-1] if quote else raw_url
-            separator = "&" if "?" in url else "?"
-            updated.append(f"{prefix}{quote}{url}{separator}{query_string}{quote}")
-            embedded = True
-        return updated
-
-    def _normalize_query_param_value(self, value: str) -> str:
-        if PERCENT_ENCODED_SEQUENCE_REGEX.search(value):
-            return unquote(value)
-        return value
-
-    def _override_query_param_block(self, block: list[str], value: str) -> list[str]:
-        result = []
-        saw_disabled = False
-        for line in block:
-            if re.match(r"^      value:\s*", line):
-                result.append(f"      value: {json.dumps(value)}")
-            elif re.match(r"^      disabled:\s*", line):
-                result.append("      disabled: false")
-                saw_disabled = True
-            else:
-                result.append(line)
-
-        if not saw_disabled:
-            result.append("      disabled: false")
-        return result
-
-    async def _run_request_baseline(
-        self,
-        bru_command: str,
-        collection_dir: Path,
-        request_path: str,
-        params: Any,
-    ) -> list[Any] | None:
-        """Run the request once without filter overrides and return its response items (None when unavailable)."""
-        sanitized_collection_dir = self._sanitize_collection_for_cli(collection_dir)
-        request_file = sanitized_collection_dir / request_path
-        if not request_file.is_file():
-            return None
-        async with report_file("bruno-filter-baseline-", ".json") as output_file:
-            args, _diagnostics = self._build_bru_args(bru_command, request_path, params, output_file)
-            await self._run_bru(args, sanitized_collection_dir)
-            if not output_file.is_file():
-                return None
-            try:
-                json_result = json.loads(output_file.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
-                return None
-        first_result = json_result[0] if isinstance(json_result, list) and json_result else {}
-        results = first_result.get("results", []) or []
-        raw_result = results[0] if results else {}
-        response = raw_result.get("response") or {}
-        return self._extract_response_items(response.get("data"))
-
-    def _classify_failure_layer(self, request: RequestDetail | None) -> str | None:
-        """Classify infrastructure-level failures that make filter evaluation inconclusive."""
-        if request is None:
-            return None
-        if request.error:
-            return "connectivity"
-        status_text = str(request.status_text or "")
-        message = f"{request.status} {status_text}"
-        if self._is_auth_failure(message):
-            return "auth"
-        status_code = int(request.status) if str(request.status).isdigit() else None
-        if status_code is not None and ROUTING_FAILURE_REGEX.search(str(status_code)):
-            return "routing"
-        if status_code in (502, 503, 504) or TIMEOUT_FAILURE_REGEX.search(status_text):
-            return "timeout"
-        if status_code is not None and status_code >= 500:
-            return "server_error"
-        return None
-
-    def _build_validation_checks(
-        self,
-        result: dict,
-        query_params: dict[str, str],
-        baseline_items: list[Any] | None = None,
-    ) -> list[ValidationCheck]:
-        request = self._build_request_detail(result)
-        response = result.get("response") or {}
-        response_data = response.get("data")
-        checks = [
-            ValidationCheck(
-                name="http_status",
-                status="passed" if not self._is_failed_request(request) else "failed",
-                message=f"HTTP status is {request.status} {request.status_text or ''}".strip(),
-            )
-        ]
-
-        failure_layer = self._classify_failure_layer(request)
-        if failure_layer is not None:
-            checks.append(
-                ValidationCheck(
-                    name="failure_layer",
-                    status="failed",
-                    message=(
-                        f"Infrastructure failure ({failure_layer}): filter behaviour cannot be evaluated. "
-                        f"Fix the {failure_layer} issue and rerun before reporting filter defects."
-                    ),
-                )
-            )
-            checks.append(
-                ValidationCheck(name="response_body", status="skipped", message=f"Not evaluated: {failure_layer} failure.")
-            )
-            for name in query_params:
-                checks.append(
-                    ValidationCheck(name=f"filter:{name}", status="skipped", message=f"Not evaluated: {failure_layer} failure.")
-                )
-            return checks
-
-        items = self._extract_response_items(response_data)
-        if response_data is None:
-            checks.append(ValidationCheck(name="response_body", status="skipped", message="Response body is empty."))
-            return checks
-
-        checks.append(
-            ValidationCheck(
-                name="response_body",
-                status="passed",
-                message=f"Response body type is {type(response_data).__name__}; item count is {self._response_item_count(response_data)}.",
-            )
-        )
-
-        for name, value in query_params.items():
-            checks.append(self._validate_filter_param(name, value, items))
-
-        checks.append(self._build_filter_impact_check(query_params, items, baseline_items))
-
-        return checks
-
-    def _build_filter_impact_check(
-        self,
-        query_params: dict[str, str],
-        items: list[Any] | None,
-        baseline_items: list[Any] | None,
-    ) -> ValidationCheck:
-        """Compare the filtered response against the unfiltered baseline to prove the filter had an effect."""
-        restrictive = [
-            (name, value)
-            for name, value in query_params.items()
-            if name not in {"offset", "limit", "sortBy", "sortOrder"} and value.strip().upper() != "ALL"
-        ]
-        if not restrictive:
-            return ValidationCheck(
-                name="filter_impact",
-                status="skipped",
-                message="Scenario has no restrictive filter; baseline comparison not applicable.",
-            )
-        if baseline_items is None or items is None:
-            return ValidationCheck(
-                name="filter_impact",
-                status="skipped",
-                message="Baseline comparison unavailable (baseline run failed or no identifiable item array).",
-            )
-        if not items:
-            if not baseline_items:
-                return ValidationCheck(
-                    name="filter_impact",
-                    status="skipped",
-                    message="Baseline also returned no items; cannot prove the filter had an effect.",
-                )
-            return ValidationCheck(
-                name="filter_impact",
-                status="passed",
-                message=(
-                    f"Filter returned 0 results while the unfiltered baseline returned {len(baseline_items)} items "
-                    "- filter applied; no matching records in the dataset."
-                ),
-            )
-        if items == baseline_items:
-            if self._items_contradict_filters(query_params, baseline_items):
-                return ValidationCheck(
-                    name="filter_impact",
-                    status="failed",
-                    message=(
-                        "Response is identical to the unfiltered baseline and contains items that violate the filter "
-                        "- the backend ignored the filter."
-                    ),
-                )
-            return ValidationCheck(
-                name="filter_impact",
-                status="skipped",
-                message=(
-                    "Response matches the baseline, but every baseline item satisfies the filter; "
-                    "cannot distinguish an ignored filter from a no-op."
-                ),
-            )
-        return ValidationCheck(
-            name="filter_impact",
-            status="passed",
-            message="Response differs from the unfiltered baseline, so the filter had an effect.",
-        )
-
-    def _items_contradict_filters(self, query_params: dict[str, str], items: list[Any]) -> bool:
-        """Return True when at least one item violates at least one restrictive scenario filter."""
-        for name, value in query_params.items():
-            if name in {"offset", "limit", "sortBy", "sortOrder"} or value.strip().upper() == "ALL":
-                continue
-            field_names = self._filter_field_names(name)
-            for item in items:
-                values = [str(found) for field_name in field_names for found in self._find_values_by_key(item, field_name)]
-                if values and not self._values_match_filter(name, value, values):
-                    return True
-        return False
-
-    def _validate_filter_param(self, name: str, value: str, items: list[Any] | None) -> ValidationCheck:
-        if name in {"offset", "sortBy", "sortOrder"}:
-            return ValidationCheck(name=f"filter:{name}", status="skipped", message="Filter affects pagination or ordering and needs baseline comparison.")
-
-        if name == "limit":
-            if items is None:
-                return ValidationCheck(name="filter:limit", status="skipped", message="Could not identify a response item array.")
-            return ValidationCheck(
-                name="filter:limit",
-                status="passed" if len(items) <= int(value) else "failed",
-                message=f"Returned {len(items)} items with limit={value}.",
-            )
-
-        if value.upper() == "ALL":
-            return ValidationCheck(name=f"filter:{name}", status="skipped", message="ALL is not restrictive, so it cannot prove filtering.")
-
-        if items is None:
-            return ValidationCheck(name=f"filter:{name}", status="skipped", message="Could not identify a response item array.")
-        if not items:
-            return ValidationCheck(name=f"filter:{name}", status="passed", message="Response returned no items, so the filter is not contradicted.")
-
-        field_names = self._filter_field_names(name)
-        mismatches = []
-        for item in items:
-            values = [str(found) for field_name in field_names for found in self._find_values_by_key(item, field_name)]
-            if not values:
-                return ValidationCheck(name=f"filter:{name}", status="skipped", message=f"Could not find a comparable field for {name} in response items.")
-            if not self._values_match_filter(name, value, values):
-                mismatches.append(values[:3])
-
-        return ValidationCheck(
-            name=f"filter:{name}",
-            status="passed" if not mismatches else "failed",
-            message=(
-                f"All returned items match {name}={value}."
-                if not mismatches
-                else f"Some returned items do not match {name}={value}; sample values: {mismatches[:3]}."
-            ),
-        )
-
-    def _filter_field_names(self, name: str) -> list[str]:
-        aliases = {
-            "minBaseScore": ["baseScore", "score"],
-            "maxBaseScore": ["baseScore", "score"],
-            "minSeverityScore": ["severityScore"],
-            "maxSeverityScore": ["severityScore"],
-            "fromCreatedAt": ["createdAt", "created_at"],
-            "toCreatedAt": ["createdAt", "created_at"],
-            "fromUpdatedAt": ["updatedAt", "updated_at"],
-            "toUpdatedAt": ["updatedAt", "updated_at"],
-            "fromPublishedAt": ["publishedAt", "published_at"],
-            "toPublishedAt": ["publishedAt", "published_at"],
-            "minAgeDays": ["ageDays", "age_days"],
-            "maxAgeDays": ["ageDays", "age_days"],
-        }
-        return aliases.get(name, [name])
-
-    def _values_match_filter(self, name: str, expected: str, values: list[str]) -> bool:
-        if name.startswith("min"):
-            return any(self._to_float(value) is not None and self._to_float(value) >= float(expected) for value in values)
-        if name.startswith("max"):
-            return any(self._to_float(value) is not None and self._to_float(value) <= float(expected) for value in values)
-        if name.startswith("from"):
-            return any(value >= expected for value in values)
-        if name.startswith("to"):
-            return any(value <= expected for value in values)
-        if name in {"title", "hostname"}:
-            return any(expected.lower() in value.lower() for value in values)
-        return any(value.lower() == expected.lower() for value in values)
-
-    def _to_float(self, value: str) -> float | None:
+    def _environment_secret_conflicts(
+        self, collection_dir: Path, environment: str, secret_names: set[str]
+    ) -> set[str]:
+        env_file = self._find_environment_file(collection_dir, environment)
+        if env_file is None:
+            return set()
         try:
-            return float(value)
-        except ValueError:
-            return None
+            declared = set(self._extract_variable_names(env_file))
+            declared |= set(self._extract_list_style_variable_names(env_file))
+        except OSError:
+            return set()
+        return declared & secret_names
 
-    def _find_values_by_key(self, data: Any, key: str) -> list[Any]:
-        if isinstance(data, dict):
-            values = [value for current_key, value in data.items() if current_key.lower() == key.lower()]
-            for value in data.values():
-                values.extend(self._find_values_by_key(value, key))
-            return values
-        if isinstance(data, list):
-            values = []
-            for item in data:
-                values.extend(self._find_values_by_key(item, key))
-            return values
-        return []
+    @staticmethod
+    def _extract_list_style_variable_names(env_file: Path) -> list[str]:
+        """Match `- name: <var>` entries used by list-style environment files."""
+        names = []
+        for line in env_file.read_text(encoding="utf-8", errors="replace").splitlines():
+            match = re.match(r"^\s*-\s*name:\s*[\"']?([A-Za-z_][A-Za-z0-9_\-.]*)[\"']?\s*$", line)
+            if match:
+                names.append(match.group(1))
+        return names
 
-    def _response_item_count(self, response_data: Any) -> int | None:
-        items = self._extract_response_items(response_data)
-        return len(items) if items is not None else None
+    def _remove_env_variables(self, sanitized_collection_dir: Path, environment: str, names: set[str]) -> None:
+        env_file = self._find_environment_file(sanitized_collection_dir, environment)
+        if env_file is None:
+            return
 
-    def _extract_response_items(self, response_data: Any) -> list[Any] | None:
-        if isinstance(response_data, list):
-            return response_data
-        if isinstance(response_data, dict):
-            for key in ["data", "items", "results", "content", "records", "entries"]:
-                value = response_data.get(key)
-                if isinstance(value, list):
-                    return value
-        return None
+        if env_file.suffix == ".json":
+            try:
+                data = json.loads(env_file.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                logger.warning("env_conflict_neutralize_failed file=%s reason=invalid_json", env_file)
+                return
+            variables = data.get("variables")
+            if isinstance(variables, list):
+                data["variables"] = [
+                    variable
+                    for variable in variables
+                    if not (isinstance(variable, dict) and variable.get("name") in names)
+                ]
+                env_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            return
 
-    def _preview_response_data(self, response_data: Any, depth: int = 0) -> Any:
-        if response_data is None or isinstance(response_data, bool | int | float):
-            return response_data
-        if isinstance(response_data, str):
-            return response_data[:MAX_PREVIEW_STRING_CHARS]
-        if isinstance(response_data, list):
-            preview = [self._preview_response_data(item, depth + 1) for item in response_data[:MAX_PREVIEW_LIST_ITEMS]]
-            if len(response_data) > MAX_PREVIEW_LIST_ITEMS:
-                preview.append({"_omitted_items": len(response_data) - MAX_PREVIEW_LIST_ITEMS})
-            return preview
-        if isinstance(response_data, dict):
-            if depth >= 2:
-                preview = {
-                    key: self._redacted_or_short_value(key, value)
-                    for key, value in list(response_data.items())[:MAX_PREVIEW_DICT_KEYS]
-                }
-            else:
-                preview = {
-                key: self._preview_response_data(value, depth + 1) if not SECRET_KEY_REGEX.search(str(key)) else "<redacted>"
-                    for key, value in list(response_data.items())[:MAX_PREVIEW_DICT_KEYS]
-                }
-            if len(response_data) > MAX_PREVIEW_DICT_KEYS:
-                preview["_omitted_keys"] = len(response_data) - MAX_PREVIEW_DICT_KEYS
-            return preview
-        return str(response_data)[:MAX_PREVIEW_STRING_CHARS]
+        lines = env_file.read_text(encoding="utf-8", errors="replace").splitlines()
+        removed: list[str] = []
+        kept: list[str] = []
+        index = 0
+        while index < len(lines):
+            line = lines[index]
+            map_match = re.match(r"^(\s*)[\"']?([A-Za-z_][A-Za-z0-9_\-.]*)[\"']?\s*[:=]", line)
+            list_match = re.match(r"^(\s*)-\s*name:\s*[\"']?([A-Za-z_][A-Za-z0-9_\-.]*)[\"']?\s*$", line)
+            if list_match and list_match.group(2) in names:
+                indent = list_match.group(1)
+                removed.append(list_match.group(2))
+                index += 1
+                while index < len(lines):
+                    continuation = lines[index]
+                    if continuation.strip() and not continuation.startswith(f"{indent} "):
+                        break
+                    if re.match(rf"^{re.escape(indent)}-\s+name:", continuation):
+                        break
+                    index += 1
+                continue
+            if map_match and map_match.group(2) in names:
+                removed.append(map_match.group(2))
+                index += 1
+                continue
+            kept.append(line)
+            index += 1
 
-    def _redacted_or_short_value(self, key: str, value: Any) -> Any:
-        if SECRET_KEY_REGEX.search(str(key)):
-            return "<redacted>"
-        if isinstance(value, str):
-            return value[:MAX_PREVIEW_STRING_CHARS]
-        if isinstance(value, bool | int | float) or value is None:
-            return value
-        return f"<{type(value).__name__}>"
+        if removed:
+            env_file.write_text("\n".join(kept) + "\n", encoding="utf-8")
+            logger.info("env_conflicts_removed file=%s variables=%s", env_file, sorted(set(removed)))
 
-    async def _run_bru(self, args: list[str], cwd: Path) -> tuple[int, str, str]:
-        process = await asyncio.create_subprocess_exec(
-            *args,
-            cwd=cwd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout_bytes, stderr_bytes = await process.communicate()
-        return (
-            process.returncode or 0,
-            stdout_bytes.decode(errors="replace"),
-            stderr_bytes.decode(errors="replace"),
-        )
+    # ------------------------------------------------------------------
+    # Artifacts and temp copies
+    # ------------------------------------------------------------------
 
     def _write_artifact(self, prefix: str, content: str) -> ArtifactInfo:
-        artifact_dir = Path.cwd() / "build" / "artifacts"
-        artifact_dir.mkdir(parents=True, exist_ok=True)
-        timestamp = int(datetime.now(timezone.utc).timestamp() * 1000)
-        artifact_path = artifact_dir / f"{prefix}-{timestamp}.json"
-        artifact_path.write_text(content, encoding="utf-8")
-        return ArtifactInfo(
-            path=str(artifact_path),
-            description="Full raw Bruno JSON report. Use read-result-artifact for a bounded summary.",
-        )
+        return artifacts.write_artifact(prefix, content, self._settings)
 
-    def read_run_artifact(self, params: ReadRunArtifactParams) -> ReadRunArtifactResult:
-        artifact_path = Path(params.path)
-        if not artifact_path.is_file():
-            return ReadRunArtifactResult(
-                artifact=ArtifactInfo(path=str(artifact_path), description="Not found."),
-                requests=[],
-            )
-
-        raw_report = json.loads(artifact_path.read_text(encoding="utf-8"))
-        first_result = raw_report[0] if raw_report else {}
-        results = first_result.get("results", []) or []
-
-        request_summaries = []
-        for result in results:
-            request = result.get("request") or {}
-            response = result.get("response") or {}
-            response_data = response.get("data")
-            request_summaries.append(
-                ArtifactRequestSummary(
-                    name=result.get("name") or result.get("suitename") or "Unknown request",
-                    path=result.get("path"),
-                    method=request.get("method"),
-                    url=request.get("url"),
-                    status=response.get("status") or result.get("status"),
-                    status_text=response.get("statusText"),
-                    response_time=response.get("responseTime") or response.get("duration"),
-                    response_data=self._summarize_response_data(response_data, params.max_items),
-                )
-            )
-
-        return ReadRunArtifactResult(
-            artifact=ArtifactInfo(
-                path=str(artifact_path),
-                description="Bounded, redacted summary of the raw Bruno JSON report.",
-            ),
-            requests=request_summaries,
-        )
-
-    def _summarize_response_data(self, response_data: Any, max_items: int) -> ResponseDataSummary:
-        if response_data is None:
-            return ResponseDataSummary(data_type=None, item_count=None, top_level_keys=[], item_keys=[], sample_items=[])
-
-        top_level_keys = list(response_data.keys()) if isinstance(response_data, dict) else []
-        items = self._extract_response_items(response_data)
-
-        if items is None:
-            return ResponseDataSummary(
-                data_type=type(response_data).__name__,
-                item_count=None,
-                top_level_keys=top_level_keys,
-                item_keys=[],
-                sample_items=[self._preview_response_data(response_data)],
-            )
-
-        item_keys = []
-        if items and isinstance(items[0], dict):
-            item_keys = list(items[0].keys())
-
-        return ResponseDataSummary(
-            data_type=type(response_data).__name__,
-            item_count=len(items),
-            top_level_keys=top_level_keys,
-            item_keys=item_keys,
-            sample_items=[self._preview_response_data(item) for item in items[:max_items]],
-        )
+    def _cleanup_sanitized_collections(self) -> None:
+        """Delete temporary sanitized collection copies; reports are already persisted as artifacts."""
+        sanitized_root = Path.cwd() / "build" / "sanitized-collections"
+        if not sanitized_root.is_dir():
+            return
+        for entry in sanitized_root.iterdir():
+            if entry.is_dir():
+                shutil.rmtree(entry, ignore_errors=True)
 
     def _sanitize_collection_for_cli(self, collection_dir: Path) -> Path:
         sanitized_root = Path.cwd() / "build" / "sanitized-collections"
-        sanitized_workspace = sanitized_root / f"{collection_dir.name}-{int(datetime.now(timezone.utc).timestamp() * 1000)}"
+        sanitized_workspace = sanitized_root / f"{collection_dir.name}-{int(_utc_now().timestamp() * 1000)}"
         sanitized_collections_dir = sanitized_workspace / "collections"
         sanitized_dir = sanitized_collections_dir / collection_dir.name
         shutil.copytree(
@@ -1362,26 +831,126 @@ class BrunoRunner:
             )
 
         for yaml_file in [*sanitized_dir.rglob("*.yml"), *sanitized_dir.rglob("*.yaml")]:
-            self._sanitize_yaml_for_bru_cli(yaml_file)
+            sanitize_yaml_for_bru_cli(yaml_file)
 
         return sanitized_dir
 
-    def _sanitize_yaml_for_bru_cli(self, yaml_file: Path) -> None:
-        content = yaml_file.read_text(encoding="utf-8")
-        sanitized_lines = []
-        changed = False
+    # ------------------------------------------------------------------
+    # Collection resolution and confinement
+    # ------------------------------------------------------------------
 
-        for line in content.splitlines():
-            match = PLAIN_DESCRIPTION_WITH_COLON_REGEX.match(line)
-            if match:
-                prefix, value = match.groups()
-                sanitized_lines.append(f"{prefix}{json.dumps(value)}")
-                changed = True
-            else:
-                sanitized_lines.append(line)
+    def _resolve_collection_target(self, collection_path: Path) -> tuple[Path, str | None]:
+        path = collection_path.expanduser().resolve()
+        self._check_root_confinement(path)
 
-        if changed:
-            yaml_file.write_text("\n".join(sanitized_lines) + "\n", encoding="utf-8")
+        if path.name in {"opencollection.yml", "opencollection.yaml"}:
+            return path.parent, None
+
+        if path.is_dir() and self._is_collection_root(path):
+            return path, None
+
+        if path.suffix in {".bru", ".vru"}:
+            collection_root = self._find_collection_root(path.parent)
+            if collection_root is None:
+                return path.parent, path.name
+            return collection_root, str(path.relative_to(collection_root))
+
+        return path.parent, path.name
+
+    def _check_root_confinement(self, path: Path) -> None:
+        """Reject collection paths outside the configured workspace roots.
+
+        Confinement only applies when at least one configured root exists on disk;
+        with no usable roots configured (for example right after installation, when
+        the config still has placeholder roots) any path is accepted.
+        """
+        if not self._settings.enforce_root_confinement:
+            return
+        roots = [root.expanduser().resolve() for root in load_bruno_roots()]
+        existing_roots = [root for root in roots if root.is_dir()]
+        if not existing_roots:
+            return
+        if any(path == root or root in path.parents for root in existing_roots):
+            return
+        logger.warning("collection_path_rejected path=%s roots=%s", path, existing_roots)
+        raise PermissionError(
+            f"Collection path {path} is outside the configured workspace roots "
+            f"({', '.join(str(root) for root in existing_roots)}). "
+            "Add the parent Bruno root to bruno-mcp.toml [workspace] roots, or set "
+            "BRUNO_MCP_ENFORCE_ROOT_CONFINEMENT=0 to disable this check."
+        )
+
+    def _is_collection_root(self, path: Path) -> bool:
+        return (path / "opencollection.yml").is_file() or (path / "opencollection.yaml").is_file()
+
+    def _find_collection_root(self, path: Path) -> Path | None:
+        for candidate in [path, *path.parents]:
+            if self._is_collection_root(candidate):
+                return candidate
+        return None
+
+    def _find_environments_dir(self, collection_path: Path) -> Path | None:
+        candidates = []
+
+        for parent in [collection_path, *collection_path.parents]:
+            if parent.name == "collections":
+                candidates.append(parent.parent / "environments")
+            candidates.append(parent / "environments")
+
+        for candidate in candidates:
+            if candidate.is_dir():
+                return candidate
+
+        return None
+
+    def _extract_variable_names(self, environment_file: Path) -> list[str]:
+        try:
+            content = environment_file.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            content = environment_file.read_text(encoding="latin-1")
+
+        names = set(VARIABLE_NAME_REGEX.findall(content))
+        return sorted(names)
+
+    # ------------------------------------------------------------------
+    # Filter discovery
+    # ------------------------------------------------------------------
+
+    def _list_request_filter_info(self, collection_dir: Path) -> list[RequestFilterInfo]:
+        requests = []
+        for request_file in sorted(collection_dir.rglob("*.yml")) + sorted(collection_dir.rglob("*.yaml")):
+            if request_file.name in {"opencollection.yml", "opencollection.yaml"}:
+                continue
+            if "environments" in request_file.relative_to(collection_dir).parts:
+                continue
+
+            try:
+                content = request_file.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                content = request_file.read_text(encoding="latin-1")
+
+            name = first_yaml_value(content, "info", "name") or request_file.stem
+            method = first_yaml_value(content, "http", "method")
+            url = first_yaml_value(content, "http", "url")
+            query_params = parse_query_params(content)
+            if not query_params:
+                continue
+
+            requests.append(
+                RequestFilterInfo(
+                    name=name,
+                    path=str(request_file.relative_to(collection_dir)),
+                    method=method,
+                    url=url,
+                    enabled_query_params=[param for param in query_params if not param.disabled],
+                    disabled_query_params=[param for param in query_params if param.disabled],
+                )
+            )
+        return requests
+
+    # ------------------------------------------------------------------
+    # Inherited variable resolution (unchanged lookup order)
+    # ------------------------------------------------------------------
 
     def _resolve_inherited_variable(self, variable_name: str) -> dict[str, Any] | None:
         variable_value = os.environ.get(variable_name)
@@ -1435,82 +1004,3 @@ class BrunoRunner:
                     if candidate not in names:
                         names.append(candidate)
         return names
-
-    async def _ensure_bru_cli(self) -> str:
-        bru_command = shutil.which("bru")
-        if bru_command:
-            return bru_command
-
-        npm_command = shutil.which("npm")
-        if not npm_command:
-            raise RuntimeError(
-                "Bruno CLI command `bru` is not installed and `npm` was not found, so it cannot be installed automatically."
-            )
-
-        process = await asyncio.create_subprocess_exec(
-            npm_command,
-            "install",
-            "-g",
-            "@usebruno/cli",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _stdout_bytes, stderr_bytes = await process.communicate()
-        if process.returncode != 0:
-            stderr = stderr_bytes.decode(errors="replace")
-            raise RuntimeError(f"Bruno CLI `bru` is not installed and automatic npm installation failed: {stderr}")
-
-        bru_command = shutil.which("bru")
-        if not bru_command:
-            raise RuntimeError("Bruno CLI installation completed, but `bru` is still not available in PATH.")
-
-        return bru_command
-
-    def _resolve_collection_target(self, collection_path: Path) -> tuple[Path, str | None]:
-        path = collection_path.expanduser().resolve()
-
-        if path.name in {"opencollection.yml", "opencollection.yaml"}:
-            return path.parent, None
-
-        if path.is_dir() and self._is_collection_root(path):
-            return path, None
-
-        if path.suffix in {".bru", ".vru"}:
-            collection_root = self._find_collection_root(path.parent)
-            if collection_root is None:
-                return path.parent, path.name
-            return collection_root, str(path.relative_to(collection_root))
-
-        return path.parent, path.name
-
-    def _is_collection_root(self, path: Path) -> bool:
-        return (path / "opencollection.yml").is_file() or (path / "opencollection.yaml").is_file()
-
-    def _find_collection_root(self, path: Path) -> Path | None:
-        for candidate in [path, *path.parents]:
-            if self._is_collection_root(candidate):
-                return candidate
-        return None
-
-    def _find_environments_dir(self, collection_path: Path) -> Path | None:
-        candidates = []
-
-        for parent in [collection_path, *collection_path.parents]:
-            if parent.name == "collections":
-                candidates.append(parent.parent / "environments")
-            candidates.append(parent / "environments")
-
-        for candidate in candidates:
-            if candidate.is_dir():
-                return candidate
-
-        return None
-
-    def _extract_variable_names(self, environment_file: Path) -> list[str]:
-        try:
-            content = environment_file.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            content = environment_file.read_text(encoding="latin-1")
-
-        names = set(VARIABLE_NAME_REGEX.findall(content))
-        return sorted(names)

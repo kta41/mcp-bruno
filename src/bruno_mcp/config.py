@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import os
-import tomllib
 from pathlib import Path
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as tomllib  # type: ignore[no-redef]
 
 DEFAULT_CONFIG_PATHS = [
     Path.cwd() / "bruno-mcp.toml",
