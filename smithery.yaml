@@ -1,0 +1,11 @@
+# Smithery configuration file: https://smithery.ai/docs/config#smitheryyaml
+
+startCommand:
+  type: stdio
+  configSchema:
+    type: object
+    properties: {}
+  commandFunction:
+    |-
+    (config) => ({ command: 'uv', args: ['run', 'bruno-mcp'] })
+  exampleConfig: {}

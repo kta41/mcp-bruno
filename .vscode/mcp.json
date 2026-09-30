@@ -1,0 +1,9 @@
+{
+  "servers": {
+    "bruno-runner": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "bruno-mcp"]
+    }
+  }
+}

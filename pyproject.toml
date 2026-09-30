@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bruno-mcp"
+version = "0.1.0"
+description = "MCP server for running Bruno collections"
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+license = { text = "MIT" }
+keywords = ["bruno", "mcp", "api-testing"]
+dependencies = [
+  "mcp>=1.0.0",
+  "pydantic>=2.0.0"
+]
+
+[project.scripts]
+bruno-mcp = "bruno_mcp.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.uv]
+package = true
+

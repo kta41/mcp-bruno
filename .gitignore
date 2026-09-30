@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+dist/
+build/
+
+# Local configuration and secrets (never commit real roots or tokens)
+bruno-mcp.toml
+.bearer_token
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# Editors and OS
+.idea/
+.vs/
+.DS_Store
+Thumbs.db

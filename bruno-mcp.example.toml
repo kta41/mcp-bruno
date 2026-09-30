@@ -1,0 +1,17 @@
+[workspace]
+roots = [
+  "/home/user/project/bruno"
+]
+
+[auth]
+inherited_variables = [
+  "BRUNO_AUTH_TOKEN",
+  "BRUNO_API_KEY"
+]
+
+[auth.variable_aliases]
+BRUNO_AUTH_TOKEN = ["BRUNO_AUTH_TOKEN", "bearerToken", "BEARER_TOKEN", "AUTH_TOKEN", "TOKEN", "accessToken", "access_token"]
+BRUNO_API_KEY = ["BRUNO_API_KEY", "apiKey", "API_KEY", "xApiKey", "x-api-key"]
+
+[defaults]
+environment = "des"
