@@ -260,7 +260,7 @@ docker run --rm -i bruno-mcp-python
 └── bruno-mcp.example.toml # Commented configuration template
 ```
 ---
-mcp-name: io.github.Kta41/bruno-mcp
+mcp-name: io.github.kta41/bruno-mcp
 ---
 
 
