@@ -6,7 +6,7 @@ from pathlib import Path
 try:
     import tomllib
 except ModuleNotFoundError:  # Python 3.10
-    import tomli as tomllib  # type: ignore[no-redef]
+    import tomli as tomllib
 
 DEFAULT_CONFIG_PATHS = [
     Path.cwd() / "bruno-mcp.toml",
