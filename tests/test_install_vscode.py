@@ -1,6 +1,16 @@
+import importlib.util
 import unittest
+from pathlib import Path
 
-from scripts.install_vscode import build_remote_server_config, build_server_config
+_INSTALL_VSCODE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "install_vscode.py"
+_INSTALL_VSCODE_SPEC = importlib.util.spec_from_file_location("install_vscode", _INSTALL_VSCODE_PATH)
+if _INSTALL_VSCODE_SPEC is None or _INSTALL_VSCODE_SPEC.loader is None:
+    raise ImportError(f"Unable to load install_vscode module from {_INSTALL_VSCODE_PATH}")
+_INSTALL_VSCODE_MODULE = importlib.util.module_from_spec(_INSTALL_VSCODE_SPEC)
+_INSTALL_VSCODE_SPEC.loader.exec_module(_INSTALL_VSCODE_MODULE)
+
+build_remote_server_config = _INSTALL_VSCODE_MODULE.build_remote_server_config
+build_server_config = _INSTALL_VSCODE_MODULE.build_server_config
 
 
 class InstallVscodeConfigTests(unittest.TestCase):
