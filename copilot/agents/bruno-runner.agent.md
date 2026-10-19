@@ -39,7 +39,7 @@ If `run-collection` or `run-filter-scenarios` return an `artifact.path`, and you
 12. If `run-collection` reports a missing inherited variable, explain which name must be configured in the MCP environment or as a VS Code secure input.
 13. If `run-collection` returns `auth_failure: true`:
     - Show `diagnostics.inherited_variables`: if `resolved` is false or `length` is 0, VS Code is not passing the token; run `MCP: Reset Input`, re-enter `BRUNO_AUTH_TOKEN` (or `BRUNO_BEARER_TOKEN`) and restart the `bruno-runner` server.
-    - If `resolved` is true and `length` > 0 but the 401 persists, the token is invalid or expired. As a temporary alternative, the user can write it to `~/.config/bruno-mcp/.bearer_token` and restart the server (secure local fallback).
+    - If `resolved` is true and `length` > 0 but the 401 persists, the token is invalid or expired. As a temporary alternative, the user can write the raw token to `~/.config/bruno-mcp/.bearer_token` and restart the server (secure local fallback).
     - Do not ask for the token value in the chat.
 14. Do not modify Bruno collection files unless the user explicitly asks for it.
 15. Do not narrate the process or post intermediate messages like "found it", "let me inspect", "There is a single collection", "launching" or "running". Use the tools silently and reply only at the end, unless you need a decision from the user. If you need more payload detail, use `read-result-artifact` with the returned `artifact.path`.

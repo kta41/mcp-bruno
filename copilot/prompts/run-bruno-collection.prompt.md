@@ -78,7 +78,7 @@ The collection requires BRUNO_AUTH_TOKEN. Set that value in the VS Code MCP secu
 
 If `run-collection` returns `auth_failure: true`:
 - Show `diagnostics.inherited_variables`: if `resolved` is false or `length` is 0, VS Code is not passing the token; run `MCP: Reset Input`, re-enter `BRUNO_AUTH_TOKEN` (or `BRUNO_BEARER_TOKEN`) and restart the `bruno-runner` server.
-- If `resolved` is true and `length` > 0 but the 401 persists, the token is invalid or expired. As a temporary alternative, the user can write it to `~/.config/mcp-bruno/.bearer_token` and restart the server (secure local fallback).
+- If `resolved` is true and `length` > 0 but the 401 persists, the token is invalid or expired. As a temporary alternative, the user can write the raw token to `~/.config/bruno-mcp/.bearer_token` and restart the server (secure local fallback).
 
 ## How To Reply
 

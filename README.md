@@ -224,18 +224,55 @@ Two-phase orchestration in a single tool call:
 
 ---
 
-## 🤖 Prompt and Agent Automation
+## Agent Skills & Copilot Integration
 
-The project includes reusable Copilot prompt and agent templates:
-* **Prompt template:** `copilot/prompts/run-bruno-collection.prompt.md`
-* **Agent template:** `copilot/agents/bruno-runner.agent.md`
+These workflows use the MCP server configured as `bruno-runner`; installing a skill or prompt does not install or configure the server. Configure the server in your client first using the MCP configuration above.
 
-Install them globally with:
+### VS Code GitHub Copilot
+
+The repository includes a [custom agent](copilot/agents/bruno-runner.agent.md) and a [slash-command prompt](copilot/prompts/run-bruno-collection.prompt.md). From this repository root, copy them into the target workspace:
+
+```bash
+mkdir -p /path/to/workspace/.github/agents /path/to/workspace/.github/prompts
+cp copilot/agents/bruno-runner.agent.md /path/to/workspace/.github/agents/
+cp copilot/prompts/run-bruno-collection.prompt.md /path/to/workspace/.github/prompts/
+```
+
+Select the `bruno-runner` custom agent in Copilot Chat's agent picker (`@bruno-runner` where supported), or run `/run-bruno-collection <collection or path> [environment]` in Chat. The slash command works independently of selecting the custom agent.
+
+Alternatively, install both globally with:
+
 ```bash
 uv run python scripts/install_vscode.py --with-copilot-customizations
 ```
 
-The agent will seamlessly navigate the workspace, discover collections/environments, handle credentials securely via `inherited_variables`, and return detailed execution summaries:
+### Claude Code / Cursor / Windsurf
+
+The universal [Bruno Runner skill](skills/bruno-runner/SKILL.md) consolidates collection discovery, environment selection, standard runs, targeted filter scenarios, full two-phase validation, secret safety, and reporting rules.
+
+For Claude Code, copy it into the target project's skill directory:
+
+```bash
+mkdir -p /path/to/workspace/.claude/skills/bruno-runner
+cp skills/bruno-runner/SKILL.md /path/to/workspace/.claude/skills/bruno-runner/SKILL.md
+```
+
+Or symlink the skill directory using an absolute source path:
+
+```bash
+mkdir -p /path/to/workspace/.claude/skills
+ln -s /absolute/path/to/mcp-bruno/skills/bruno-runner /path/to/workspace/.claude/skills/bruno-runner
+```
+
+For Cursor, copy or symlink the same directory to `.cursor/skills/bruno-runner/`; for Windsurf, use `.windsurf/skills/bruno-runner/` in the target workspace. Skill discovery depends on your client's version and configuration. For clients using rules instead, adapt the skill body into their native rule format (for example, a `.cursor/rules/bruno-runner.mdc` file with Cursor rule frontmatter); merely copying `SKILL.md` into a rules directory does not guarantee activation.
+
+Ask to run a collection, validate a specific filter, or test all endpoints and filters. The workflows resolve secrets locally through `inherited_variables`; never paste credentials into chat. The server's local token fallback is `~/.config/bruno-mcp/.bearer_token` (raw token), not `~/.config/mcp-bruno/.bearer_token`. After updating it, restart the MCP server.
+
+### Repository Assets
+
+Skills and Copilot templates remain organized under `skills/` and `copilot/` at the repository root, separately from the Python packages discovered under `src/` in `pyproject.toml`. They are repository assets, not installed wheel resources; use a repository checkout for the copy, symlink, and installer commands above. Installing the Python package alone does not register agent workflows with a client.
+
+Execution results retain the server's normalized output contract:
 
 ```json
 {
@@ -281,6 +318,7 @@ docker run --rm -i bruno-mcp-python
 ├── src/bruno_mcp/         # MCP server, runner, config, and types
 ├── scripts/               # VS Code installer script
 ├── copilot/               # Reusable Copilot prompt and agent templates
+├── skills/bruno-runner/    # Universal Agent Skill (SKILL.md)
 ├── tests/                 # Unit tests
 ├── .vscode/mcp.json       # Workspace MCP server entry
 └── bruno-mcp.example.toml # Commented configuration template
