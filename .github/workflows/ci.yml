@@ -1,9 +1,11 @@
-name: CI
+name: CI & Publish
 
 on:
   push:
     branches: [main]
   pull_request:
+  release:
+    types: [published]
 
 jobs:
   quality:
@@ -16,6 +18,8 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
 
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
@@ -39,3 +43,35 @@ jobs:
 
       - name: Build image
         run: docker build .
+
+  publish:
+    name: Publish to PyPI
+    needs: [quality, docker]
+    if: github.event_name == 'release' && github.event.action == 'published'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/mcp-bruno
+    permissions:
+      id-token: write # Necesario para OIDC Trusted Publishing (cero API tokens)
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Verify tag matches pyproject.toml version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION=$(uv run python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "❌ Error: El tag de Git ($GITHUB_REF_NAME -> $TAG_VERSION) no coincide con la versión en pyproject.toml ($PKG_VERSION)"
+            exit 1
+          fi
+
+      - name: Build package (sdist and wheel)
+        run: uv build
+
+      - name: Publish to PyPI via OIDC
+        uses: pypa/gh-action-pypi-publish@release/v1
