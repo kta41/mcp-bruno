@@ -6,7 +6,8 @@
 [![MCP](https://img.shields.io/badge/Model_Context_Protocol-Enabled-blue?style=for-the-badge)](https://modelcontextprotocol.io/)
 [![Bruno](https://img.shields.io/badge/Bruno-API_Client-orange?style=for-the-badge)](https://www.usebruno.com/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](https://opensource.org/licenses/MIT)
-
+<br>
+[![kta41/mcp-bruno MCP server](https://glama.ai/mcp/servers/kta41/mcp-bruno/badges/score.svg)](https://glama.ai/mcp/servers/kta41/mcp-bruno)
 </div>
 
 > Python MCP server for running [Bruno](https://www.usebruno.com/) collections. It exposes a Model Context Protocol server over `stdio` with tools that run collections through the `bru` CLI and return normalized JSON results.
